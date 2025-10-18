@@ -5,7 +5,7 @@
  * Description: make a bed file from a FasTAN .1aln file
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 16 05:10 2025 (rd109)
+ * Last edited: Oct 18 13:00 2025 (rd109)
  * Created: Thu Oct 16 02:48:43 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -18,11 +18,10 @@ Gdb *readGdb (OneFile *of, int k)
   oneReadLine (of) ; // swallow the g line
 
   Gdb *gdb = new0 (1, Gdb) ;
-  int N = oneCountUntilNext (of, 'S', 'g') ;
-  gdb->seqDict = dictCreate (N) ;
-  gdb->seqLen = new0 (N, I64) ;
-  gdb->child = new0 (N, int) ;
-  // gdb->nCtg = oneCountUntilNext (of, 'C', 'g') ; // 'C' not an object type
+  I64 maxSeq ; oneStatsContains (of, 'g', 'S', &maxSeq, 0) ;
+  gdb->seqDict = dictCreate (maxSeq) ;
+  gdb->seqLen = new0 (maxSeq, I64) ;
+  gdb->child = new0 (maxSeq, int) ;
   I64 maxCount ; oneStatsContains (of, 'g', 'C', &maxCount, 0) ;
   gdb->ctgLen = new0 (maxCount, I64) ;
   gdb->parent = new0 (maxCount, int) ;
@@ -62,7 +61,8 @@ static inline int ctg2seq (Gdb *gdb, int ctg) { return gdb->parent[ctg] ; }
 static inline I64 ctg2pos (Gdb *gdb, int ctg, I64 x) { return gdb->offset[ctg] + x ; }
 
 typedef struct {
-  int seq ;
+  int seq ;          // for bed output need seq
+  int ctg ;          // for masking need contig
   I64 start, end ;
   int unit ;
   int score ;
@@ -78,13 +78,20 @@ static int bedSort (const void *a, const void *b)
 
 int main (int argc, char *argv[])
 {
+  storeCommandLine (argc, argv) ;
   --argc ; ++argv ;
+  bool isMask = false ;
+  while (argc && **argv == '-')
+    if (!strcmp (*argv, "-mask")) { isMask = true ; --argc ; ++argv ; }
+    else die ("unknown option %s for tanbed", *argv) ;
   if (argc != 1) die ("Usage: tanbed <.1aln file>") ;
+
   OneSchema *schema = oneSchemaCreateFromText (alnSchemaText) ;
   OneFile *of = oneFileOpenRead (*argv, schema, "aln", 1) ;
   if (!of) die ("failed to open .1aln file %s", *argv) ;
   Gdb *gdb = readGdb (of, 1) ;
   if (of->lineType != 'A') die ("unexpected line type %c", of->lineType) ;
+
   I64 nAlign = 0 ;
   oneStats (of, 'A', &nAlign, 0, 0) ;
   Array ab = arrayCreate (nAlign, BedLine) ;
@@ -94,22 +101,35 @@ int main (int argc, char *argv[])
       int ctg = oneInt(of,0) ;
       if (ctg != oneInt(of,3))
 	die ("target mismatch line %lld - not a TAN file?", (long long)of->line) ;
-      b->seq = ctg2seq(gdb,ctg) ;
-      b->start = ctg2pos(gdb,ctg,oneInt(of,4)) ;
-      b->end = ctg2pos(gdb,ctg,oneInt(of,2)) ;
-      double len = oneInt(of,2) - oneInt(of,4) ;
-      totAlign += oneInt(of,2) - oneInt(of,4) ;
-      while (oneReadLine(of) && of->lineType != 'A')
-	if (of->lineType == 'D') b->score = (int)(1000*(1.0 - oneInt(of,0)/len)) ;
-	else if (of->lineType == 'U') b->unit = oneInt(of,0) ;
+      if (isMask)
+	{ b->ctg = ctg ; b->start = oneInt (of, 4) ; b->end = oneInt(of, 2) ;
+	  while (oneReadLine(of) && of->lineType != 'A') { ; }
+	}
+      else
+	{ b->seq = ctg2seq(gdb,ctg) ;
+	  b->start = ctg2pos(gdb,ctg,oneInt(of,4)) ;
+	  b->end = ctg2pos(gdb,ctg,oneInt(of,2)) ;
+	  double len = oneInt(of,2) - oneInt(of,4) ;
+	  totAlign += oneInt(of,2) - oneInt(of,4) ;
+	  while (oneReadLine(of) && of->lineType != 'A')
+	    if (of->lineType == 'D') b->score = (int)(1000*(1.0 - oneInt(of,0)/len)) ;
+	    else if (of->lineType == 'U') b->unit = oneInt(of,0) ;
+	}
     }
+  oneFileClose (of) ;
+
   arraySort (ab, bedSort) ;
   int i ;
-  for (i = 0 ; i < arrayMax(ab) ; ++i)
-    { BedLine *b = arrp(ab, i, BedLine) ;
-      printf ("%s\t", dictName(gdb->seqDict, b->seq)) ;
-      printf ("%lld\t%lld\t%d\t%d\n", (long long)b->start, (long long)b->end, b->unit, b->score) ;
+  if (isMask)
+    { die ("sorry, masking not implemented yet") ;
     }
+  else
+    for (i = 0 ; i < arrayMax(ab) ; ++i)
+      { BedLine *b = arrp(ab, i, BedLine) ;
+	printf ("%s\t", dictName(gdb->seqDict, b->seq)) ;
+	printf ("%lld\t%lld\t%d\t%d\n", (long long)b->start, (long long)b->end, b->unit, b->score) ;
+      }
+  
   I64 totSeq = 0 ; for (i = 0 ; i < gdb->nSeq ; ++i) totSeq += gdb->seqLen[i] ;
   fprintf (stderr, "processed %lld alignments total length %lld from %s length %lld (%.1f %%)\n",
 	   nAlign, totAlign, *argv, totSeq, totAlign/(0.01*totSeq)) ;
