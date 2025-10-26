@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 26 20:36 2025 (rd109)
+ * Last edited: Oct 26 22:31 2025 (rd109)
  * Created: Sun Oct 19 21:45:26 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -194,7 +194,7 @@ int main (int argc, char *argv[])
   OneSchema *schema = oneSchemaCreateFromText (schemaText) ;
   OneFile *ofIn = oneFileOpenRead (argv[0],schema, "gdb", 1) ;
   if (!ofIn) die ("failed to open %s as a gdb ONEcode file", argv[0]) ;
-  Gdb *gdb =readGdb (ofIn, 1, stdout) ;
+  Gdb *gdb = readGdb (ofIn, 1, stdout) ;
 
   if (gdb->maxMask) // throw away the current mask
     { newFree (gdb->mask, gdb->maxMask, I64) ;
@@ -253,17 +253,18 @@ int main (int argc, char *argv[])
   arrayDestroy (ab) ;
   
   OneFile *ofOut = oneFileOpenWriteNew (outFileName, schema, "gdb", true, 1) ;
-  if (!ofOut) die ("failed to open ZZ.1gdb as output") ;
+  if (!ofOut) die ("failed to open %s as output", outFileName) ;
   oneInheritProvenance (ofOut, ofIn) ;
-  oneInheritReference (ofOut, ofIn) ;
+  oneAddProvenance (ofOut, "gdbmask", VERSION, getCommandLine()) ;
   writeGdb (ofOut, gdb, 1, stdout) ;
   oneFileClose (ofOut) ;
   if (!strcmp (outFileName, argv[0])) printf ("!! rerun GIXmake %s to apply new mask\n", argv[0]) ;
 
   gdbDestroy (gdb) ;
   oneFileClose (ofIn) ;
-  
-  exit (0) ;
+
+  destroyCommandLine () ;
+  return 0 ; 
 }
 
 #endif
