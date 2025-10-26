@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 16 04:26 2025 (rd109)
+ * Last edited: Oct 26 19:36 2025 (rd109)
  * Created: Thu Oct 16 02:49:56 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -14,8 +14,19 @@
 #include "utils.h"
 #include "ONElib.h"
 
-static char *alnSchemaText =
+#define VERSION "0.1"
+
+static char schemaText[] =
   "1 3 def 2 1                 schema for aln and FastGA\n"
+  ".\n"
+  ".\n"
+  "P 3 gdb                             GDB\n"
+  "D f 4 4 REAL 4 REAL 4 REAL 4 REAL   global: base frequency vector\n"
+  "D u 0                               global: upper case when displayed\n"
+  "O S 1 6 STRING                      id for a scaffold\n"
+  "D G 1 3 INT                         gap of given length\n"
+  "D C 1 3 INT                         contig of given length\n"
+  "D M 1 8 INT_LIST                    mask pair list for a contig\n"
   ".\n"
   "P 3 seq                     SEQUENCE\n"
   "O s 2 3 INT 6 STRING        length and id for group of sequences = a scaffold\n"
@@ -51,12 +62,53 @@ static char *alnSchemaText =
 ;
 
 typedef struct {
-  int   nSeq, nCtg ;
-  DICT *seqDict ;	// names of sequences
-  I64  *seqLen ;	// lengths of sequences
-  I64  *ctgLen ;	// contig lengths
-  int  *child ;         // first contig for each sequence (-1 if sequence has no contigs, all gap)
-  int  *parent ;	// parent sequence for each contig
-  I64  *offset ;	// offset in parent of each contig
+  char  *seqFileName, *seqPathName ;  // from of->reference - not owned by the Gdb
+  double fA, fC, fG, fT ;	// 'f' frequences of A,C,G,T
+  bool   isUpper ;	 	// 'u' upper case for non-masked sequence
+  int    nSeq, nCtg, nGap ;
+  I64    maxSeq, maxCtg, maxMask ; // used to allocate arrays below
+  I64    totSeq, totCtg, totMask ; // total length including gaps, without gaps, of mask
+  DICT  *seqDict ;       	// names of sequences
+  I64   *seqLen ;	 	// lengths of sequences
+  I64   *ctgLen ;	 	// contig lengths
+  int   *ctgSeq ;	 	// parent sequence for each contig
+  I64   *ctgPos ;	 	// offset in parent of each contig
+  int   *ctgMaskCount ;  	// number of masks in each contig
+  int   *ctgMaskStart ;         // start of contigs's mask entries in ->mask
+  I64   *mask ;		 	// mask positions (two per masked region)
 } Gdb ;
 
+static inline int ctg2seq (Gdb *gdb, int ctg) { return gdb->ctgSeq[ctg] ; }
+static inline I64 ctg2pos (Gdb *gdb, int ctg, I64 x) { return gdb->ctgPos[ctg] + x ; }
+
+/****************** BED file structures ***********************/
+
+typedef struct {
+  U32 seq ;          // for bed output need seq
+  int ctg ;          // for masking need contig
+  I64 start, end ;
+  int unit ;
+  int score ;
+} BedLine ;
+
+static int bedSort (const void *a, const void *b)
+{
+  BedLine *ba = (BedLine*)a, *bb = (BedLine*)b ;
+  if (ba->seq != bb->seq) return ba->seq - bb->seq ;
+  if (ba->start != bb->start) return ba->start - bb->start ;
+  return ba->end - bb->end ;
+}
+
+/************ in gdb.c ************/
+
+Gdb *readGdb (OneFile *of, int k, FILE *report) ;
+// read from either a .1gdb file (set k == 1) or the k'th skeleton within of
+// writes a summary line if report != NULL
+
+void writeGdb (OneFile *of, Gdb *gdb, int k, FILE *report) ;
+
+void gdbDestroy (Gdb *gdb) ;
+
+OneFile *gdbFile (OneFile *ofAln, int number) ;
+
+/************************ end of file *************************/

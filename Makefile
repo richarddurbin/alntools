@@ -5,7 +5,7 @@ CFLAGS = -O3
 
 LIBS = -lpthread -lz
 
-ALL = tanbed ONEview
+ALL = tanbed gdbmask ONEview
 
 DESTDIR = ~/bin
 
@@ -28,10 +28,15 @@ ONElib.o: ONElib.h
 
 tanbed.o: alntools.h ONElib.h $(UTILS_HEADERS)
 
+gdb.o: alntools.h ONElib.h $(UTILS_HEADERS)
+
 ### programs
 
-tanbed: tanbed.o ONElib.o $(UTILS_OBJS)
+tanbed: tanbed.o gdb.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+gdbmask: gdb.c ONElib.o $(UTILS_OBJS)
+	$(CC) -D GDB_MASK $(CFLAGS) -o $@ $^ $(LIBS)
 
 ONEview: ONEview.c ONElib.o
 	$(CC) $(CFLAGS) -o $@ $^
