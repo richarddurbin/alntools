@@ -26,8 +26,7 @@
  * Exported functions:
  *              See Header file: array.h (includes lots of macros)
  * HISTORY:
- * Last edited: Sep 29 18:36 2024 (rd109)
- * * Aug 31 22:04 2024 (rd109): added ArrayPool
+ * Last edited: Aug 11 22:57 2024 (rd109)
  * * Feb 14 11:21 2011 (rd): modified in 2009/10 by RD for stand-alone use
  * Created: Thu Dec 12 15:43:25 1989 (mieg)
  *-------------------------------------------------------------------
@@ -93,10 +92,11 @@ Array uArrayReCreate (Array a, U64 n, U64 size)
   if (n < 1) n = 1 ;
 
   if (a->dim < n || (a->dim - n)*size > (1 << 20) ) /* free if save > 1 MB */
-    { totalAllocatedMemory -= a->dim * size ; 
-      myfree (a->base, a->dim*size) ;
+    { totalAllocatedMemory -= a->dim * size ;
+      free (a->base) ;
       a->dim = n ;
       totalAllocatedMemory += a->dim * size ;
+      /* base-mem isn't alloc'd on handle, it's free'd by finalisation */
       a->base = mycalloc (n, size) ;
     }
   else
@@ -113,15 +113,15 @@ void arrayDestroy (Array a)
   if (!arrayExists (a))
     die ("arrayDestroy called on bad array %lx", (long unsigned int) a) ;
 
-  totalAllocatedMemory -= a->dim * a->size ; 
+  totalAllocatedMemory -= a->dim * a->size ;
   totalNumberActive-- ;
 #ifdef ARRAY_REPORT
   if (reportArray)
     arr(reportArray, a->id, Array) = 0 ;
 #endif
   a->magic = 0 ;
-  myfree (a->base, a->dim*a->size) ;
-  newFree (a, 1, struct ArrayStruct) ;
+  free (a->base) ;
+  free (a) ;
 }
 
 /**************/
@@ -143,13 +143,14 @@ Array arrayCopy (Array a)
 
 void arrayExtend (Array a, U64 n) 
 {
+  char *new ;
+
   if (!arrayExists (a))
     die ("arrayExtend called on bad array %lx", (long unsigned int) a) ;
 
   if (n < a->dim)
     return ;
 
-  U64 oldDim = a->dim ;
   totalAllocatedMemory -= a->dim * a->size ;
   if (a->dim*a->size < 1 << 23)	/* 8MB */
     a->dim *= 2 ;
@@ -160,7 +161,10 @@ void arrayExtend (Array a, U64 n)
 
   totalAllocatedMemory += a->dim * a->size ;
 
-  a->base = newResize (a->base, oldDim*a->size, a->dim*a->size, char) ;
+  new = mycalloc (a->dim, a->size) ;
+  memcpy (new,a->base,a->size*a->max) ;
+  free (a->base) ;
+  a->base = new ;
 
   return;
 }
@@ -218,11 +222,7 @@ Array   arrayRead (FILE *f)
   Array a = new (1, struct ArrayStruct) ;
   if (fread (a, sizeof(struct ArrayStruct), 1, f) != 1) return 0 ;
   a->base = myalloc (a->size*a->dim) ;
-  if (fread (a->base, a->size, a->dim, f) != a->dim)
-    { myfree (a->base, a->size*a->dim) ;
-      newFree (a, 1, struct ArrayStruct) ;
-      return 0 ;
-    }
+  if (fread (a->base, a->size, a->dim, f) != a->dim) { free(a) ; return 0 ; }
 #ifdef ARRAY_REPORT
   a->id = ++totalNumberCreated ;
   if (reportArray)
@@ -245,7 +245,7 @@ Array   arrayRead (FILE *f)
         */
 
 /* bool arrayFind(Array a, void *s, U64 *ip, U64 (* order)(void*, void*)) */
-bool arrayFind(Array a, void *s, U64 *ip, ArrayOrder *order)
+bool arrayFind (Array a, void *s, U64 *ip, ArrayOrder *order)
 {
   U64 ord ;
   U64 i = 0 , j, k ;
@@ -325,7 +325,7 @@ bool arrayRemove (Array a, void * s, int (* order)(const void*, const void*))
         * in ascending order of s.begin
         */
 
-bool arrayInsert(Array a, void * s, int (*order)(const void*, const void*))
+bool arrayInsert (Array a, void *s, int (*order)(const void*, const void*))
 {
   U64 i, j, arraySize;
 
@@ -364,34 +364,29 @@ bool arrayInsert(Array a, void * s, int (*order)(const void*, const void*))
 
 /**************/
 
-void arrayCompress(Array a)
+bool arrayCompress (Array a, ArrayOrder *order)
 {
-  U64 i, j, k , as ;
-  char *x, *y, *ab ;
+  U64 i, j, k ;
+  char *x, *y ;
 
   if (!arrayExists (a))
     die ("arrayCompress called on bad array %lx", (long unsigned int) a) ;
 
   if (arrayMax(a) < 2)
-    return ;
+    return true ;
 
-  ab = a->base ; 
-  as = a->size ;
   for (i = 1, j = 0 ; i < arrayMax(a) ; i++)
-    { x = ab + i * as ; y = ab + j * as ;
-      for (k = a->size ; k-- ;)		
-	if (*x++ != *y++) 
-	  goto different ;
-      continue ;
-      
-    different:
+    { int c = order (uArray(a,i), uArray(a,j)) ;
+      if (c < 0) return false ;
+      if (c == 0) continue ;
       if (i != ++j)
-	{ x = ab + i * as ; y = ab + j * as ;
+	{ x = a->base + i * a->size ; y = a->base + j * a->size ;
 	  for (k = a->size ; k-- ;)	 
 	    *y++ = *x++ ;
 	}
     }
   arrayMax(a) = j + 1 ;
+  return true ;
 }
 
 /**************/
@@ -411,7 +406,7 @@ void arrayReport (U64 j)
   U64 i ;
   Array a ;
 
-  fprintf(stderr, "Array report: %llu created, %llu active, %llu MB allocated\n",   
+  fprintf(stderr, "Array report: %" PRIu64 " created, %" PRIu64 " active, %" PRIu64 " MB allocated\n",   
 	  totalNumberCreated, totalNumberActive, totalAllocatedMemory/(1024*1024)) ;
 
   if (reportArray)
@@ -419,7 +414,7 @@ void arrayReport (U64 j)
       while (i-- && i > j)
 	{ a = arr (reportArray, i, Array) ;
 	  if (arrayExists(a))
-	    fprintf (stderr, " array %llu size %llu max %llu\n", i, a->size, a->max) ;
+	    fprintf (stderr, " array %" PRIu64 "  size %" PRIu64 ", max %" PRIu64 "\n", i, a->size, a->max) ;
 	}
     }
 }
@@ -443,4 +438,5 @@ void arrayStatus (U64 *nmadep, U64 *nusedp, U64 *memAllocp, U64 *memUsedp)
 }
 
 /************************  end of file ********************************/
+/**********************************************************************/
  

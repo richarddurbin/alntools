@@ -24,7 +24,7 @@
  * Exported functions:
  *              the Array type and associated macros and functions
  * HISTORY:
- * Last edited: May 29 12:51 2023 (rd109)
+ * Last edited: Aug 11 22:56 2024 (rd109)
  *-------------------------------------------------------------------
  */
 
@@ -94,7 +94,7 @@ typedef int ArrayOrder(const void*, const void*) ;             /* call back func
 #define arraySort(a,order)  qsort((a)->base, (a)->max, (a)->size, order)
 bool    arrayInsert(Array a, void * s, ArrayOrder *order);
 bool    arrayRemove(Array a, void * s, ArrayOrder *order);
-void    arrayCompress(Array a) ;
+bool    arrayCompress(Array a, ArrayOrder *order) ;
 bool    arrayFind(Array a, void *s, U64 *ip, ArrayOrder *order);
 
 #ifdef ARRAY_REPORT
