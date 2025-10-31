@@ -5,7 +5,7 @@
  * Description: IO for ONEcode .1aln files for Myers FASTGA package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 31 19:10 2025 (rd109)
+ * Last edited: Oct 31 19:33 2025 (rd109)
  * Created: Sat Feb 24 12:19:16 2024 (rd109)
  *-------------------------------------------------------------------
  */
@@ -254,6 +254,7 @@ OneFile *open_Aln_Read (char *filename, int nThreads,
   OneFile   *of;
   OneInfo   *refInfo;
   int        i;
+  int t ; if (!tspace) tspace = &t ;
 
   schema = oneSchemaCreateFromText(alnSchemaText);
   if (schema == NULL) 
@@ -303,7 +304,7 @@ OneFile *open_Aln_Read (char *filename, int nThreads,
 
   *tspace = 0;
   while (oneReadLine(of))             // advance to first alignment record
-    if (of->lineType == 'A' || of->lineType == 'g')
+    if (of->lineType == 'A') // || of->lineType == 'g')
       break;
     else if (of->lineType == 't')
       *tspace = oneInt(of,0);

@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 31 19:12 2025 (rd109)
+ * Last edited: Oct 31 19:40 2025 (rd109)
  * Created: Fri Aug  9 22:41:44 2024 (rd109)
  *-------------------------------------------------------------------
  */
@@ -164,7 +164,7 @@ int main (int argc, char *argv[])
   OneFile *ofIn = open_Aln_Read (*argv, 1, &nOverlaps, 0, &db1Name, &db2Name, &cpath) ;
 
   // if db1Name and db2Name are the same, then we have a self-alignment
-  if (strcmp (db1Name, db2Name) == 0)
+  if (db2Name && !strcmp (db1Name, db2Name))
     { warn ("self-alignment: db1Name %s and db2Name %s are the same", db1Name, db2Name) ;
       free (db2Name) ;
       db2Name = 0 ;
@@ -182,7 +182,7 @@ int main (int argc, char *argv[])
 
   if (ofb)
     { if (!db2Name)
-	      die ("-b not possible: input %s has no b source (it has self-a alignments only)", *argv) ;
+	die ("-b not possible: input %s has no b source (it has self-a alignments only)", *argv) ;
       oneAddReference (ofb, db2Name, 1) ; // NB change of order here
       oneAddReference (ofb, db1Name, 2) ;
       oneAddReference (ofb, cpath, 3) ;
@@ -198,7 +198,7 @@ int main (int argc, char *argv[])
   oneFileClose (ofIn) ;
 
   if (!db2Name) // add the reverse matches
-    { newResize (olaps, nOverlaps, 2*nOverlaps, Overlap) ;
+    { olaps = newResize (olaps, nOverlaps, 2*nOverlaps, Overlap) ;
       Overlap *o1 = olaps, *o2 = olaps + nOverlaps ;
       for (i = 0 ; i < nOverlaps ; ++i, ++o1, ++o2) flip (o1, o2) ;
       nOverlaps *= 2 ;
