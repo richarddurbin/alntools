@@ -30,3 +30,22 @@ wrote GDB to mGorGor.1gdb : 26 seqs 28 contigs (2 gaps), totSeq 3545850636 totCt
 Note that, as requested in the final line of the output, you need to run GIXmake again from the [FastGA package](https://github.com/thegenemyers/FASTGA) in order for this masking to take effect in subsequent `FastGA` runs, and you also need to remember to set the `-M` option for "use soft Masks" when running `FastGA`.
 
 By default `gdbmask` overwrites the given `.1gdb` file.  If you wish to keep that and write a new `.1gdb` file then you can use option `[-o newfile.1gdb]`, but for downstream tools to subsequently use the resulting `newfile.1gdb` you will need to create by copying (or linking) a corresponding hidden `.newname.bps` file that contains the 2-bit compressed sequence.
+
+## svfind
+
+retrieves large insertions and deletions from a .1aln file.  Example usage is:
+
+```
+> svfind -a ~/tmp/dmel-dmau-a.1sv -b ~/tmp/dmel-dmau-b.1sv dmel-dmau.1aln
+read 130445 overlaps
+user	0.100205	system	0.006640	elapsed 0.108578	alloc_max 6 MB	max_RSS	19562496
+wrote 3355 insertions in ../Drosophila_melanogaster/Dmela-FKT.1gdb to /Users/rd109/tmp/dmel-dmau-a.1sv
+user	0.696388	system	0.016602	elapsed 0.713271	alloc_max 107 MB	max_RSS	86114304
+wrote 3438 insertions in ../Drosophila_mauritiana/Dmaur-FKT.1gdb to /Users/rd109/tmp/dmel-dmau-b.1sv
+user	0.685140	system	0.014473	elapsed 0.699762	alloc_max 208 MB	max_RSS	71139328
+Total resources used: user	1.481736	system	0.037810	elapsed 1.521707	alloc_max 208 MB	max_RSS	176816128
+```
+Note that the outputs are ONEcode files of type .1sv.  Run `ONEview -H outfile.1sv` for header information, and `ONEview -h outfile.1sv` for the results data.
+
+There are lots of options.  Ask Pio Sierra <mailto:pas211@cam.ac.uk> for further information about them if you are interested in modifying them!
+
