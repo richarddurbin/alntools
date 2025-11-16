@@ -6,7 +6,7 @@
  * Description: make a bed file from a FasTAN .1aln file
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 26 19:36 2025 (rd109)
+ * Last edited: Nov 16 10:12 2025 (rd109)
  * Created: Thu Oct 16 02:48:43 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -27,10 +27,10 @@ int main (int argc, char *argv[])
 
   I64 nAlign = 0 ;
   oneStats (of, 'A', &nAlign, 0, 0) ;
-  Array ab = arrayCreate (nAlign, BedLine) ;
+  Array ab = arrayCreate (nAlign, TanLine) ;
   I64 totAlign = 0 ;
   while (of->lineType == 'A')
-    { BedLine *b = arrayp(ab, arrayMax(ab), BedLine) ;
+    { TanLine *b = arrayp(ab, arrayMax(ab), TanLine) ;
       int ctg = oneInt(of,0) ;
       if (ctg != oneInt(of,3))
 	die ("target mismatch line %lld - not a TAN file?", (long long)of->line) ;
@@ -43,12 +43,12 @@ int main (int argc, char *argv[])
 	if (of->lineType == 'D') b->score = (int)(1000*(1.0 - oneInt(of,0)/len)) ;
 	else if (of->lineType == 'U') b->unit = oneInt(of,0) ;
     }
-  oneFileClose (of) ; // used it in the isMask option
+  oneFileClose (of) ;
+  arraySort (ab, tanSort) ;
 
-  arraySort (ab, bedSort) ;
   int i ;
   for (i = 0 ; i < arrayMax(ab) ; ++i)
-    { BedLine *b = arrp(ab, i, BedLine) ;
+    { TanLine *b = arrp(ab, i, TanLine) ;
       printf ("%s\t", dictName(gdb->seqDict, b->seq)) ;
       printf ("%lld\t%lld\t%d\t%d\n", (long long)b->start, (long long)b->end, b->unit, b->score) ;
     }

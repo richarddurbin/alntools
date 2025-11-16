@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 26 19:36 2025 (rd109)
+ * Last edited: Nov 16 10:18 2025 (rd109)
  * Created: Thu Oct 16 02:49:56 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -89,14 +89,14 @@ typedef struct {
   I64 start, end ;
   int unit ;
   int score ;
-} BedLine ;
+} TanLine ;
 
-static int bedSort (const void *a, const void *b)
+static int tanSort (const void *a, const void *b)
 {
-  BedLine *ba = (BedLine*)a, *bb = (BedLine*)b ;
-  if (ba->seq != bb->seq) return ba->seq - bb->seq ;
-  if (ba->start != bb->start) return ba->start - bb->start ;
-  return ba->end - bb->end ;
+  TanLine *ta = (TanLine*)a, *tb = (TanLine*)b ;
+  if (ta->seq != tb->seq) return ta->seq - tb->seq ;
+  if (ta->start != tb->start) return ta->start - tb->start ;
+  return ta->end - tb->end ;
 }
 
 /************ in gdb.c ************/

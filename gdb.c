@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 26 22:31 2025 (rd109)
+ * Last edited: Nov 16 10:04 2025 (rd109)
  * Created: Sun Oct 19 21:45:26 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -186,9 +186,11 @@ int main (int argc, char *argv[])
     { outFileName = argv[1] ; argc -= 2 ; argv += 2 ; }
 
   if (argc != 2)
-    die ("Usage: gdbmask [-o <outfile>] <XX.1gdb> <bed file>\n"
-	 "  default is to overwrite the input .1gdb - stash beforehand or use -o to keep it") ;
-
+    { fprintf (stderr, "Usage: gdbmask [-o <outfile>] <XX.1gdb> <bed file>\n"
+	       "  default is to overwrite the input .1gdb - stash beforehand or use -o to keep\n") ;
+      exit (1) ;
+    }
+     
   if (!outFileName) outFileName = argv[0] ; // seems to be OK
 
   OneSchema *schema = oneSchemaCreateFromText (schemaText) ;
@@ -211,8 +213,8 @@ int main (int argc, char *argv[])
   // next read the bed file
   FILE *f = fopen (argv[1], "r") ;
   if (!f) die ("failed to open %s for reading", argv[1]) ;
-  Array    ab = arrayCreate (4096, BedLine) ;
-  BedLine *bl = arrayp (ab, arrayMax(ab), BedLine) ;
+  Array    ab = arrayCreate (4096, TanLine) ;
+  TanLine *bl = arrayp (ab, arrayMax(ab), TanLine) ;
   char     nameBuf[4096] ;
   while (fscanf (f, "%s\t%lld\t%lld\t%d\t%d\n",
 		 nameBuf, &bl->start, &bl->end, &bl->unit, &bl->score) == 5)
@@ -224,10 +226,10 @@ int main (int argc, char *argv[])
       if (bl->end > gdb->seqLen[bl->seq])
 	die ("end %lld off the end %lld of the sequence",
 	     (long long)bl->end, (long long) gdb->seqLen[bl->seq]) ;
-      bl = arrayp (ab, arrayMax(ab), BedLine) ;
+      bl = arrayp (ab, arrayMax(ab), TanLine) ;
     }
   --arrayMax(ab) ;
-  arraySort (ab, bedSort) ; // need to ensure it is sorted
+  arraySort (ab, tanSort) ; // need to ensure it is sorted
   fprintf (stdout, "read %lld bed lines from %s\n", (long long)arrayMax(ab), argv[1]) ;
   fclose (f) ;
 
@@ -235,10 +237,10 @@ int main (int argc, char *argv[])
   gdb->maxMask = 2*arrayMax(ab) ;
   gdb->mask = new (gdb->maxMask, I64) ;
   I64 *m = gdb->mask ;
-  BedLine *bi = arrp(ab, 0, BedLine) ;
-  BedLine *bend = arrp(ab, arrayMax(ab), BedLine) ; // will not deref bend - just an end marker
+  TanLine *bi = arrp(ab, 0, TanLine) ;
+  TanLine *bend = arrp(ab, arrayMax(ab), TanLine) ; // will not deref bend - just an end marker
   while (bi < bend)
-    { BedLine *bj = bi ;
+    { TanLine *bj = bi ;
       I64 *m0 = m ;
       while (bj < bend && bj->seq == bi->seq)
 	{ *m++ = bj->start ;
@@ -309,7 +311,7 @@ OneFile *gdbFile (OneFile *ofAln, int number)
   if (ofGdb) return ofGdb ;
   die ("The .1aln file %s referred to a sequence file %s but we need\n"
        "to mask a .1gdb file. We successfully ran FAtoGDB to make the .1gdb, but can't find it.\n"
-       "Please rerun FasTAN on the .1gdb file and rerun tanbed -mask on that.\n") ;
+       "Please rerun FasTAN on the .1gdb file and rerun gdbmask on that.\n") ;
   return 0 ; // for compiler happiness
 }
 */
