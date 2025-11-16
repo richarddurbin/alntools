@@ -1,9 +1,9 @@
 # alntools
-utilities for processing .1aln files from FastGA, FasTAN etc.
+utilities for processing .1aln files from [FastGA](https://github.com/thegenemyers/FASTGA), [FasTAN](https://github.com/thegenemyers/FASTAN) etc.
 
 Make with `make` and install with `make install`.  If you want to install elsewhere than the default `~/bin` directory then `make DESTDIR=/your/preferred/location`.
 
-Currently there are two programs:
+Current contents are:
 
 ## tanbed
 
@@ -30,6 +30,28 @@ wrote GDB to mGorGor.1gdb : 26 seqs 28 contigs (2 gaps), totSeq 3545850636 totCt
 Note that, as requested in the final line of the output, you need to run GIXmake again from the [FastGA package](https://github.com/thegenemyers/FASTGA) in order for this masking to take effect in subsequent `FastGA` runs, and you also need to remember to set the `-M` option for "use soft Masks" when running `FastGA`.
 
 By default `gdbmask` overwrites the given `.1gdb` file.  If you wish to keep that and write a new `.1gdb` file then you can use option `[-o newfile.1gdb]`, but for downstream tools to subsequently use the resulting `newfile.1gdb` you will need to create by copying (or linking) a corresponding hidden `.newname.bps` file that contains the 2-bit compressed sequence.
+
+## taco
+
+TAndem repeat COmpresses a .fa.gz file using coordinates from a `.1aln` file made with [FasTAN](https://github.com/thegenemyers/FASTAN), leaving just the first unit of each tandem repeat. The idea is to use the resulting compressed sequences in subsequent genome alignments, e.g. using [FastGA](https://github.com/thegenemyers/FASTGA). The reasoning behind this is that tandem repeats expand and contract very rapidly, so are likely not to be the same length between two otherwise alignable sequences - in fact because of this expansion/contraction and gene conversion it may well be that copies within a sequences are more closely related to each other than copies between sequences. Also, pragmatically aligners including FastGA can become very inefficient when aligning tandem repeats to each other, exploring and potentially re-exploring exponentially many similar alternatives.  Example usage is: 
+
+```
+> taco
+Usage: taco [-o <outFileName>] <input.1aln> <seqFile>
+  taco stands for 'TAndem COmpress' (cf hoco for 'HOmopolymer COmpress')
+  input.1aln should be created by FasTAN and the names and lengths must match to seqFile
+  default outFileName is <seqFile-stem>-taco.1seq;  user given outFileName can end in .fa or .fa.gz or .1seq
+> taco mGorGor-tan.1aln mGorGor.fa.gz
+read GDB from mGorGor-tan.1aln : 26 seqs 28 contigs (2 gaps), totSeq 3545850636 totCtg 3543850636 (99.944%)
+> seqstat mGorGor.fa.gz
+fasta file, 26 sequences >= 0, 3545850636 total, 136378870.62 average, 16412 min, 243847345 max
+> seqstat mGorGor-taco.fa.gz
+fasta file, 26 sequences >= 0, 2872001354 total, 110461590.54 average, 16412 min, 223911933 max
+```
+
+By default taco converts `XX.fa.gz` to `XX-taco.fa.gz`. Option `-o <name.fa.gz>` will write an alternative file name.
+
+As of 16/11/2025, taco writes out a warning for each repeat in the input `.1aln` file that is contained within the first instance of another repeat, and does not compress it. There are not so many of these and they are typically short dinucleotide to tetranucleotide repeats. I aim to correctly compress these nested repeats and remove this warning. Also, there is not yet a tool to map the results of aligning taco sequences back into the original reference coordinates.
 
 ## svfind
 
