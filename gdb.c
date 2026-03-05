@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Nov 16 10:04 2025 (rd109)
+ * Last edited: Mar  5 19:22 2026 (rd109)
  * Created: Sun Oct 19 21:45:26 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -66,6 +66,7 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) // don't report if !report
 	gdb->isUpper = true ;
 	break ;
       case 'S':
+	{ char *s = oneString(of) ; while (*s && *s != ' ' && *s != '\t') s++ ; *s = 0 ; }
 	dictAdd (gdb->seqDict, oneString(of), 0) ;
 	if (gdb->nSeq > 0) gdb->seqLen[gdb->nSeq-1] = end ;
 	end = 0 ; // reset counter
