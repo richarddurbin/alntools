@@ -49,7 +49,7 @@ gdbmask: gdb.c ONElib.o $(UTILS_OBJS)
 taco: taco.c gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-svfind: svfind.c alnseq.o alncode.o seqio.o ONElib.o $(UTILS_OBJS)
+svfind: svfind.c alnseq.o alncode.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 ONEview: ONEview.c ONElib.o
