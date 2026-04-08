@@ -46,7 +46,9 @@ tanbed: tanbed.o gdb.o ONElib.o $(UTILS_OBJS)
 gdbmask: gdb.c ONElib.o $(UTILS_OBJS)
 	$(CC) -D GDB_MASK $(CFLAGS) -o $@ $^ $(LIBS)
 
-taco: taco.c gdb.o seqio.o ONElib.o $(UTILS_OBJS)
+salsa.o: salsa.h ONElib.h $(UTILS_HEADERS)
+
+taco: taco.c salsa.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 svfind: svfind.c alnseq.o alncode.o seqio.o ONElib.o $(UTILS_OBJS)

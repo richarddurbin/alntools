@@ -59,7 +59,12 @@ static char schemaText[] =
   "D E 1 3 INT                 match: number of equal bases (currently unused)\n"
   "D Z 1 6 STRING              cigar string: encodes precise alignment (currently unused)\n"
   "D U 1 3 INT                 putative unit size of a TR alignment (FASTAN)\n"
-;
+  "P 4 taco                    TACO MAP\n"
+  "O c 2 3 INT 3 INT           sequence: origLen tacoLen\n"
+  "D I 1 6 STRING              sequence identifier\n"
+  "G L                         sequence (c) groups lift entries (L)\n"
+  "O L 4 3 INT 3 INT 3 INT 3 INT  lift event: orig_start orig_end taco_pos unit_len\n"
+  ;
 
 typedef struct {
   char  *seqFileName, *seqPathName ;  // from of->reference - not owned by the Gdb
