@@ -15,39 +15,41 @@
 #include "alncode.h" // includes ONElib.h and align.h
 #include "alnseq.h"  // includes ONElib.h and align.h
 
+#include "alntools.h"
+
 #define PROG_NAME "svfind"
 #define VERSION "0.1"
 
-static char* schemaText =
-  "1 3 def 2 1               schema for structural variants\n"
-  ".                         expects the following reference lines\n"
-  ". < a_file 1              source DNA file for insertions or duplications\n"
-  ". < b_file 2              source DNA file for corresponding deletions/single copies (if not a)\n"
-  ". < c_path 3              directory for a_file, b_file if their names are not absolute paths\n"
-  ".                         \n"
-  "P 3 seq                   SEQUENCE\n"
-  "S 2 sv                    SEQUENCE VARIANT\n"
-  "D o 1 3 INT               maximum overhang (global)\n"
-  "D s 1 3 INT               minimum insert size (global)\n"
-  "D m 1 3 INT               maximum insert size (global)\n"
-  "D x 1 3 INT               variant flank extension size (global)\n"
-  "D f 1 3 INT               minimum flanking alignment length (global)\n"
-  "D q 1 3 INT               terminal sequence size (global)\n"
-  ".                         \n"
-  "O V 3 3 INT 3 INT 3 INT   variant: seqid, start, end (0-indexed, [start,end))\n"
-  "D O 1 3 INT               overlap\n"
-  "D B 3 3 INT 3 INT 3 INT   source, start-match, end-match\n"
-  "D C 0                     flag: in reverse complement\n"
-  "D F 2 3 INT 3 INT         start-flank, end-flank\n"
-  "D X 2 3 INT 3 INT         variant flank extension\n"
-  "D Q 1 3 DNA               source sequence (start-terminal + overhang + end-terminal)\n"
-  "D D 1 3 DNA               target site duplication (TSD): sequence\n"
-  "D R 2 3 INT 3 INT         Terminal Inverted Repeat (TIR): length, number of mismatches\n"
-  "D T 2 3 INT 3 INT         Long Terminal direct Repeat (LTR): length, number of mismatches\n"
-  "G S                       insertions group sequences\n"
+static char* schemaTextSV =
+  "1 3 def 2 1                  schema for structural variants\n"
+  ".                            expects the following reference lines\n"
+  ". < a_file 1                 source DNA file for insertions or duplications\n"
+  ". < b_file 2                 source DNA file for corresponding deletions/single copies (if not a)\n"
+  ". < c_path 3                 directory for a_file, b_file if their names are not absolute paths\n"
+  ".                            \n"
+  "P 3 seq                      SEQUENCE\n"
+  "S 2 sv                       SEQUENCE VARIANT\n"
+  "D o 1 3 INT                  maximum overhang (global)\n"
+  "D s 1 3 INT                  minimum insert size (global)\n"
+  "D m 1 3 INT                  maximum insert size (global)\n"
+  "D x 1 3 INT                  variant flank extension size (global)\n"
+  "D f 1 3 INT                  minimum flanking alignment length (global)\n"
+  "D q 1 3 INT                  terminal sequence size (global)\n"
+  ".                            \n"
+  "O V 3 6 STRING 3 INT 3 INT   variant: seqid, start, end (0-indexed, [start,end))\n"
+  "D O 1 3 INT                  overlap\n"
+  "D B 3 6 STRING 3 INT 3 INT   source, start-match, end-match\n"
+  "D C 0                        flag: in reverse complement\n"
+  "D F 2 3 INT 3 INT            start-flank, end-flank\n"
+  "D X 2 3 INT 3 INT            variant flank extension\n"
+  "D Q 1 3 DNA                  source sequence (start-terminal + overhang + end-terminal)\n"
+  "D D 1 3 DNA                  target site duplication (TSD): sequence\n"
+  "D R 2 3 INT 3 INT            Terminal Inverted Repeat (TIR): length, number of mismatches\n"
+  "D T 2 3 INT 3 INT            Long Terminal direct Repeat (LTR): length, number of mismatches\n"
+  "G S                          insertions group sequences\n"
   ".\n"
-  "O S 1 3 DNA               sequence of the insertion\n"
-  "D I 1 6 STRING            identifier of the insertion\n"
+  "O S 1 3 DNA                  sequence of the insertion\n"
+  "D I 1 6 STRING               identifier of the insertion\n"
   ;
 
 static int MAX_OVERHANG = 50 ;
@@ -88,14 +90,14 @@ static int overlapOrder (const void *x, const void *y) // sort on b, a, bbpos
   c = ox->path.bbpos - oy->path.bbpos ; return c ;
 }
 
-void insertionReport (OneFile *of, AlnSeq *as, AlnSeq *bs, Overlap *olap, int n) ;
+void insertionReport (OneFile *of, AlnSeq *as, AlnSeq *bs, Gdb *gdb1, Gdb *gdb2, Overlap *olap, int n) ;
 
 int main (int argc, char *argv[])
 {
   storeCommandLine (argc--, argv++) ;
   timeUpdate (0) ;
 
-  OneSchema *schema = oneSchemaCreateFromText (schemaText) ;
+  OneSchema *schema = oneSchemaCreateFromText (schemaTextSV) ;
   OneFile   *ofa = 0, *ofb = 0 ;
   char      *ofaName, *ofbName ;
 
@@ -163,11 +165,31 @@ int main (int argc, char *argv[])
   char    *db1Name = 0, *db2Name = 0, *cpath = 0 ;
   OneFile *ofIn = open_Aln_Read (*argv, 1, &nOverlaps, 0, &db1Name, &db2Name, &cpath) ;
 
+  OneInfo   *refInfo = ofIn->info['<'];
+  if (refInfo == NULL)
+    die ("No references in aln file") ;
+
+  int i, gCnt = 1 ;
+  for (i = 0; i < refInfo->accum.count; ++i)
+    if (ofIn->reference[i].count == 2) {
+      gCnt = 2 ;
+      break ;
+    }
+
+  Gdb     *gdb1 = 0, *gdb2 = 0 ;
+  gdb1 = readGdb (ofIn, 1, stderr) ;
+  if (gCnt > 1)
+    gdb2 = readGdb (ofIn, 2, stderr) ;
+  else gdb2 = gdb1 ;
+  
   // if db1Name and db2Name are the same, then we have a self-alignment
   if (db2Name && !strcmp (db1Name, db2Name))
     { warn ("self-alignment: db1Name %s and db2Name %s are the same", db1Name, db2Name) ;
+      gCnt = 1;
       free (db2Name) ;
       db2Name = 0 ;
+      gdbDestroy (gdb2) ;
+      gdb2 = gdb1 ;
     }
   
   if (!ofIn) die ("failed to open .1aln file %s", *argv) ;
@@ -182,14 +204,15 @@ int main (int argc, char *argv[])
 
   if (ofb)
     { if (!db2Name)
-	die ("-b not possible: input %s has no b source (it has self-a alignments only)", *argv) ;
+	    die ("-b not possible: input %s has no b source (it has self-a alignments only)", *argv) ;
       oneAddReference (ofb, db2Name, 1) ; // NB change of order here
       oneAddReference (ofb, db1Name, 2) ;
       oneAddReference (ofb, cpath, 3) ;
     }
 
   Overlap *olaps = new (nOverlaps, Overlap) ;
-  int i ;
+  oneGoto(ofIn, 'A', 1) ; // go to the start of alignment
+  oneReadLine(ofIn) ;
   for (i = 0 ; i < nOverlaps ; ++i)
     { Read_Aln_Overlap (ofIn, olaps+i) ;
       Skip_Aln_Trace (ofIn) ;
@@ -213,7 +236,7 @@ int main (int argc, char *argv[])
         { if (!(bs = alnSeqOpen (db1Name, cpath, false))) die ("failed to open %s", db1Name) ; }
       else
         { if (!(bs = alnSeqOpen (db2Name, cpath, false))) die ("failed to open %s", db2Name) ; }
-      insertionReport (ofa, as, bs, olaps, nOverlaps) ;
+      insertionReport (ofa, as, bs, gdb1, gdb2, olaps, nOverlaps) ;
       printf ("wrote %d insertions in %s to %s\n",
 	      (int)ofa->info['V']->accum.count, db1Name, ofaName) ;
       oneFileClose (ofa) ;
@@ -229,7 +252,7 @@ int main (int argc, char *argv[])
         { if (!(bs = alnSeqOpen (db1Name, cpath, false))) die ("failed to open %s", db1Name) ; }
       else
         { if (!(bs = alnSeqOpen (db2Name, cpath, false))) die ("failed to open %s", db2Name) ; }
-      insertionReport (ofb, bs, as, olaps, nOverlaps) ;
+      insertionReport (ofb, bs, as, gdb2, gdb1, olaps, nOverlaps) ;
       printf ("wrote %d insertions in %s to %s\n",
 	      (int)ofb->info['V']->accum.count, db2Name, ofbName) ;
       oneFileClose (ofb) ;
@@ -240,6 +263,10 @@ int main (int argc, char *argv[])
   free (db2Name) ;
   free (cpath) ;
   free (olaps) ;
+
+  gdbDestroy (gdb1) ;
+  if (gCnt > 1) 
+    gdbDestroy (gdb2) ;
 
   printf ("Total resources used: ") ; timeTotal (stdout) ;
 }
@@ -282,7 +309,7 @@ static inline int intMin(int a, int b)
   return a < b ? a : b ;
 }
 
-void insertionReport (OneFile *of, AlnSeq *as, AlnSeq *bs, Overlap *olap, int n)
+void insertionReport (OneFile *of, AlnSeq *as, AlnSeq *bs, Gdb *gdb1, Gdb *gdb2, Overlap *olap, int n)
 // look for insertions in a with respect to b, so olap is sorted on b, then a, then b_begin
 // need to accumulate in an array and deduplicate
 {
@@ -376,10 +403,16 @@ void insertionReport (OneFile *of, AlnSeq *as, AlnSeq *bs, Overlap *olap, int n)
   is = 0 ;
   for (i = 0 ; i < arrayMax (a) ; ++i)
     { Insertion *ins = arrp(a,i,Insertion) ;
-      oneInt(of,0) = ins->a ; oneInt(of,1) = ins->a_begin ; oneInt(of,2) = ins->a_end ;
-      oneWriteLine (of, 'V', 0, 0) ;
-      oneInt(of,0) = ins->b ; oneInt(of,1) = ins->b_match_begin ; oneInt(of,2) = ins->b_match_end ;
-      oneWriteLine (of, 'B', 0, 0) ;
+      char *aseq = dictName(gdb1->seqDict, gdb1->ctgSeq[ins->a]);
+      char *bseq = dictName(gdb2->seqDict, gdb2->ctgSeq[ins->b]) ;
+      int64 a_begin = gdb1->ctgPos[ins->a] + ins->a_begin ;
+      int64 a_end = gdb1->ctgPos[ins->a] + ins->a_end ;
+      int64 b_begin = gdb2->ctgPos[ins->b] + ins->b_match_begin ;
+      int64 b_end = gdb2->ctgPos[ins->b] + ins->b_match_end ;
+      oneInt(of,1) = a_begin ; oneInt(of,2) = a_end ;
+      oneWriteLine (of, 'V', strlen(aseq), aseq) ;
+      oneInt(of,1) = b_begin ; oneInt(of,2) = b_end ;
+      oneWriteLine (of, 'B', strlen(bseq), bseq) ;
       if (ins->comp)
         oneWriteLine (of, 'C', 0, 0) ;
       while (is < ins->a)
@@ -395,8 +428,7 @@ void insertionReport (OneFile *of, AlnSeq *as, AlnSeq *bs, Overlap *olap, int n)
       oneWriteLine (of, 'X', 0, 0) ;
       oneWriteLine (of, 'Q', ins->bl, termSeq + ins->bs) ;
       oneWriteLine (of, 'S', ins->a_end - ins->a_begin + lx + rx, s + ins->a_begin - lx) ;
-      sprintf (idBuf,"%d:%d-%d_%d:%d-%d",
-	       ins->a, ins->a_begin, ins->a_end, ins->b, ins->b_match_begin, ins->b_match_end) ;
+      sprintf (idBuf,"%s:%lld-%lld_%s:%lld-%lld", aseq, a_begin, a_end, bseq, b_begin, b_end) ;
       oneWriteLine (of, 'I', strlen(idBuf), idBuf) ;
     }
   free (idBuf) ;
