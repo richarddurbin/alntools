@@ -1,65 +1,93 @@
 /*  File: taco.c
- *  Author: Richard Durbin (rd109@cam.ac.uk)
+ *  Authors: Richard Durbin (rd109@cam.ac.uk)
  *  Copyright (C) Richard Durbin, Cambridge University, 2025
  *-------------------------------------------------------------------
  * Description: TAndem COmpressor
- * Exported functions:
+ *   Subcommands: compress, collapse, reconstruct, chain, merge, lift, info
  * HISTORY:
  * Last edited: Nov 16 12:57 2025 (rd109)
  * Created: Sat Nov 15 23:37:43 2025 (rd109)
+ * Update: Mon Apr 6 20:20 2025 (am3320) - composable .1taco + .1seq system
  *-------------------------------------------------------------------
  */
 
 #include "alntools.h"
 #include "seqio.h"
+#include "salsa.h"
 
-int main (int argc, char *argv[])
+/****************** compress subcommand ******************/
+
+static int tacoCompress (int argc, char *argv[])
 {
-  storeCommandLine (argc, argv) ;
-  --argc ; ++argv ;
-
-  char *outFileName = 0 ;
-  if (argc >= 2 && !strcmp(*argv, "-o"))
-    { outFileName = argv[1] ; argc -= 2 ; argv += 2 ; }
-  
-  if (argc != 2)
-    { fprintf (stderr, "Usage: taco [-o <outFileName>] <input.1aln> <seqFile>\n"
-	       "  taco stands for 'TAndem COmpress (cf hoco for 'HOmopolymer COmpress'\n"
-	       "  input.1aln should be created by FasTAN and the names and lengths must match to seqFile\n"
-	       "  default outFileName is <seqFile-stem>-taco.1seq;"
-	       "  user given outFileName can end in .fa or .fa.gz or .1seq\n") ;
-      exit (1) ;
+  char *outPrefix = 0 ;
+  bool emitFasta = false ;
+  while (argc >= 2 && **argv == '-')
+    { if (!strcmp(*argv, "-o")) { outPrefix = argv[1] ; argc -= 2 ; argv += 2 ; }
+      else if (!strcmp(*argv, "-f")) { emitFasta = true ; --argc ; ++argv ; }
+      else break ;
     }
-  
-  // open the input .1aln file
+
+  if (argc != 2)
+    { fprintf (stderr, "Usage: taco compress [-o <prefix>] [-f] <input.1aln> <seqFile>\n"
+	       "  Generalized repeat (e.g. detected by FasTAN/FastLTR) compression and composition system.\n"
+	       "  Outputs: prefix.1taco (coordinate map) + prefix.1seq (sequences)\n"
+	       "  -f: also emit FASTA (prefix-taco.fa.gz)\n ") ;
+      return 1 ;
+    }
+
+  /* open the input .1aln file */
   OneSchema *schema = oneSchemaCreateFromText (schemaText) ;
-  OneFile *ofIn = oneFileOpenRead (argv[0],schema, "aln", 1) ;
+  OneFile *ofIn = oneFileOpenRead (argv[0], schema, "aln", 1) ;
   if (!ofIn) die ("failed to open %s as a .1aln file", argv[0]) ;
   Gdb *gdb = readGdb (ofIn, 1, stderr) ;
   if (ofIn->lineType != 'A') die ("unexpected line type %c", ofIn->lineType) ;
 
-  // and the input sequence
+  /* open the input sequence */
   SeqIO *inIO = seqIOopenRead (argv[1], dna2textConv, false) ;
   if (!inIO) die ("failed to open %s to read as a sequence file", argv[1]) ;
 
-  // and the output file
-  if (!outFileName)
-    { outFileName = new0 (strlen(argv[1]) + 10, char) ;
-      strcpy (outFileName, argv[1]) ;
-      char *s = outFileName ; while (*s) ++s ;
-      if (s > outFileName+3 && !strcmp(s-3, ".gz")) { s -= 3 ; *s = 0 ; } // remove ".gz"
-      while (s > outFileName && *s != '.') --s ;
-      if (s == outFileName) s += strlen (outFileName) ; else *s = 0 ; // remove ending from '.'
-      strcat (outFileName, "-taco.fa.gz") ;
+  /* determine output prefix */
+  char prefixBuf[1024] ;
+  if (!outPrefix)
+    { strncpy (prefixBuf, argv[1], sizeof(prefixBuf) - 20) ;
+      char *s = prefixBuf + strlen(prefixBuf) ;
+      if (s > prefixBuf+3 && !strcmp(s-3, ".gz")) { s -= 3 ; *s = 0 ; }
+      while (s > prefixBuf && *s != '.') --s ;
+      if (s == prefixBuf) s += strlen(prefixBuf) ; else *s = 0 ;
+      outPrefix = prefixBuf ;
     }
-  SeqIO *outIO = seqIOopenWrite (outFileName, 0, dna2textConv, 0) ;
-  if (!outIO) die ("failed to open %s to write as a sequence file", outFileName) ;
 
-  // now read the .1aln file
+  /* open .1taco output */
+  char tacoFileName[1024] ;
+  snprintf (tacoFileName, sizeof(tacoFileName), "%s.1taco", outPrefix) ;
+  OneSchema *mapSchema = oneSchemaCreateFromText (salsaSchemaText) ;
+  OneFile *ofTaco = oneFileOpenWriteNew (tacoFileName, mapSchema, "taco", true, 1) ;
+  oneSchemaDestroy (mapSchema) ;
+  if (!ofTaco) die ("failed to open %s to write", tacoFileName) ;
+  oneAddProvenance (ofTaco, "taco", VERSION, getCommandLine()) ;
+
+  /* open .1seq output */
+  char seqFileName[1024] ;
+  snprintf (seqFileName, sizeof(seqFileName), "%s.1seq", outPrefix) ;
+  OneSchema *seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+  OneFile *ofSeq = oneFileOpenWriteNew (seqFileName, seqSchema, "seq", true, 1) ;
+  oneSchemaDestroy (seqSchema) ;
+  if (!ofSeq) die ("failed to open %s to write", seqFileName) ;
+  oneAddProvenance (ofSeq, "taco", VERSION, getCommandLine()) ;
+
+  /* optionally open FASTA output */
+  SeqIO *fastaIO = 0 ;
+  if (emitFasta)
+    { char fastaName[1024] ;
+      snprintf (fastaName, sizeof(fastaName), "%s-taco.fa.gz", outPrefix) ;
+      fastaIO = seqIOopenWrite (fastaName, 0, dna2textConv, 0) ;
+      if (!fastaIO) die ("failed to open %s to write", fastaName) ;
+    }
+
+  /* read the .1aln file */
   I64 nAlign = 0 ;
   oneStats (ofIn, 'A', &nAlign, 0, 0) ;
   Array at = arrayCreate (nAlign, TanLine) ;
-  I64 totAlign = 0 ;
   while (ofIn->lineType == 'A')
     { TanLine *t = arrayp(at, arrayMax(at), TanLine) ;
       int ctg = oneInt(ofIn,0) ;
@@ -69,7 +97,6 @@ int main (int argc, char *argv[])
       t->start   = ctg2pos(gdb,ctg,oneInt(ofIn,4)) ;
       t->end     = ctg2pos(gdb,ctg,oneInt(ofIn,2)) ;
       double len = oneInt(ofIn,2) - oneInt(ofIn,4) ;
-      totAlign  += oneInt(ofIn,2) - oneInt(ofIn,4) ;
       while (oneReadLine(ofIn) && ofIn->lineType != 'A')
 	if (ofIn->lineType == 'D') t->score = (int)(1000*(1.0 - oneInt(ofIn,0)/len)) ;
 	else if (ofIn->lineType == 'U') t->unit = oneInt(ofIn,0) ;
@@ -77,27 +104,27 @@ int main (int argc, char *argv[])
   oneFileClose (ofIn) ;
   arraySort (at, tanSort) ;
 
-  // now build a lookup from the sequence name to start position in at
+  /* build seqStart lookup */
   int i ;
   I32 *seqStart = new0 (gdb->nSeq, I32) ;
   I32 lastSeq = -1 ;
   for (i = 0 ; i < arrayMax(at) ; ++i)
     { I32 seq = arrp(at, i, TanLine)->seq ;
       if (seq != lastSeq) { seqStart[seq] = i ; lastSeq = seq ; }
-    } // NB sequences with no matches will have value 0 - that works
+    }
 
-  // and make the buffer for writing the tandem-compressed sequence
+  /* allocate buffers */
   I64 maxSeqLen = 0 ;
   for (i = 0 ; i < gdb->nSeq ; ++i)
-    if (gdb->seqLen[i] > maxSeqLen)
-      maxSeqLen = gdb->seqLen[i] ;
+    if (gdb->seqLen[i] > maxSeqLen) maxSeqLen = gdb->seqLen[i] ;
   char *tacoSeq = new (maxSeqLen, char) ;
+  Array seqLift = arrayCreate (64, SalsaEntry) ;
 
-  // now run through inIO, writing out outIO
+  /* process each sequence */
   while (seqIOread (inIO))
     { U32 seq ;
       char *id = sqioId(inIO) ;
-      if (inIO->descLen) // need to deal with Gene including the description in the ID
+      if (inIO->descLen)
 	{ id = malloc (strlen(id) + strlen(sqioDesc(inIO)) + 2) ;
 	  sprintf (id, "%s %s", sqioId(inIO), sqioDesc(inIO)) ;
 	}
@@ -107,36 +134,666 @@ int main (int argc, char *argv[])
       if (inIO->seqLen != gdb->seqLen[seq])
 	die ("length mismatch for seq %s: %d in %s, %d in %s",
 	     sqioId(inIO), gdb->seqLen[seq], argv[0], inIO->seqLen, argv[1]) ;
+
       U64   nNew = 0, nOld = 0 ;
       char *oldSeq = sqioSeq(inIO) ;
-      // printf ("sequence %d %s length %d\n", seq, sqioId(inIO), (int) inIO->seqLen) ;
+      arrayMax(seqLift) = 0 ;
+
       for (i = seqStart[seq] ; i < arrayMax(at) && arrp(at,i,TanLine)->seq == seq ; ++i)
 	{ TanLine *t = arrp(at,i,TanLine) ;
-	  // printf ("  copying %d = %d - %d + %d from %d to %d\n", (int)(t->start - nOld + t->unit),
-	  // (int)t->start, (int)nOld, (int)t->unit, (int)nOld, (int)nNew) ;
 	  if (t->start < nOld)
 	    { t->start = nOld ;
 	      if (t->start + t->unit > t->end)
 		warn ("buried repeat %s size %d ending %lld when last ended at %lld",
 		      sqioId(inIO), t->unit, (long long) t->end, (long long) nOld) ;
-	      continue ; // just ignore this 
+	      continue ;
 	    }
+	  SalsaEntry *e = arrayp (seqLift, arrayMax(seqLift), SalsaEntry) ;
+	  e->orig_start = t->start ;
+	  e->orig_end   = t->end ;
+	  e->taco_pos   = nNew + (t->start - nOld) ;
+	  e->unit_len   = t->unit ;
+	  /* no need to copy removed DNA here; oldSeq stays valid until end of seqIOread */
 	  memcpy (tacoSeq+nNew, oldSeq+nOld, t->start - nOld + t->unit) ;
 	  nNew += t->start - nOld + t->unit ;
 	  nOld = t->end ;
 	}
       memcpy (tacoSeq+nNew, oldSeq+nOld, gdb->seqLen[seq] - nOld) ;
       nNew += gdb->seqLen[seq] - nOld ;
-      seqIOwrite (outIO, sqioId(inIO), inIO->descLen ? sqioDesc(inIO) : 0, nNew, tacoSeq, 0) ;
-    }
-  newFree (tacoSeq, maxSeqLen, char) ;
 
+      /* write .1taco: c line + I line + L lines */
+      oneInt(ofTaco,0) = gdb->seqLen[seq] ;
+      oneInt(ofTaco,1) = nNew ;
+      oneWriteLine (ofTaco, 'c', 0, 0) ;
+      oneWriteLine (ofTaco, 'I', strlen(sqioId(inIO)), sqioId(inIO)) ;
+
+      /* write .1seq: compressed sequence first, then removed DNA directly from source */
+      oneWriteLine (ofSeq, 'S', nNew, tacoSeq) ;
+
+      int j ;
+      for (j = 0 ; j < arrayMax(seqLift) ; ++j)
+	{ SalsaEntry *e = arrp(seqLift, j, SalsaEntry) ;
+	  oneInt(ofTaco,0) = e->orig_start ;
+	  oneInt(ofTaco,1) = e->orig_end ;
+	  oneInt(ofTaco,2) = e->taco_pos ;
+	  oneInt(ofTaco,3) = e->unit_len ;
+	  oneWriteLine (ofTaco, 'L', 0, 0) ;
+	  I64 removedLen = e->orig_end - e->orig_start - e->unit_len ;
+	  oneWriteLine (ofSeq, 'S', removedLen, oldSeq + e->orig_start + e->unit_len) ;
+	}
+
+      /* optionally write FASTA */
+      if (fastaIO)
+	seqIOwrite (fastaIO, sqioId(inIO), inIO->descLen ? sqioDesc(inIO) : 0, nNew, tacoSeq, 0) ;
+    }
+
+  /* cleanup */
+  arrayDestroy (seqLift) ;
+  newFree (tacoSeq, maxSeqLen, char) ;
   newFree (seqStart, gdb->nSeq, I32) ;
   arrayDestroy (at) ;
   gdbDestroy (gdb) ;
   seqIOclose (inIO) ;
-  seqIOclose (outIO) ;
-  if (outFileName != argv[1]) newFree (outFileName, strlen(argv[1]) + 10, char) ;
-  
+  oneFileClose (ofTaco) ;
+  oneFileClose (ofSeq) ;
+  if (fastaIO) seqIOclose (fastaIO) ;
+
   return 0 ;
+}
+
+/****************** collapse subcommand ******************/
+
+typedef struct {
+  I32 seq ;
+  I64 start, end ;
+  I32 unit ;
+} CollapseEvent ;
+
+static int eventSort (const void *a, const void *b)
+{
+  CollapseEvent *ea = (CollapseEvent*)a, *eb = (CollapseEvent*)b ;
+  if (ea->seq != eb->seq) return ea->seq - eb->seq ;
+  if (ea->start != eb->start) return (ea->start < eb->start) ? -1 : 1 ;
+  return (ea->end < eb->end) ? -1 : (ea->end > eb->end) ? 1 : 0 ;
+}
+
+static int tacoCollapse (int argc, char *argv[])
+{
+  char *outPrefix = 0 ;
+  bool emitFasta = false ;
+  while (argc >= 2 && **argv == '-')
+    { if (!strcmp(*argv, "-o")) { outPrefix = argv[1] ; argc -= 2 ; argv += 2 ; }
+      else if (!strcmp(*argv, "-f")) { emitFasta = true ; --argc ; ++argv ; }
+      else break ;
+    }
+
+  if (argc != 2)
+    { fprintf (stderr, "Usage: taco collapse [-o <prefix>] [-f] <spec.tsv> <input.fa>\n"
+	       "  spec.tsv: tab-separated lines: seq_index orig_start orig_end unit_len\n"
+	       "    unit_len > 0: tandem compression (keep first unit_len bases)\n"
+	       "    unit_len = 0: full deletion (remove entire interval)\n"
+	       "  Outputs: prefix.1taco + prefix.1seq\n"
+	       "  -f: also emit FASTA (prefix_collapsed.fa.gz)\n") ;
+      return 1 ;
+    }
+
+  /* read the TSV collapse spec */
+  FILE *specFile = fopen (argv[0], "r") ;
+  if (!specFile) die ("failed to open spec file %s", argv[0]) ;
+  Array events = arrayCreate (1024, CollapseEvent) ;
+  char line[1024] ;
+  int nSeq = 0 ;
+  while (fgets (line, sizeof(line), specFile))
+    { if (line[0] == '#' || line[0] == '\n') continue ;
+      CollapseEvent *e = arrayp (events, arrayMax(events), CollapseEvent) ;
+      if (sscanf (line, "%d %lld %lld %d", &e->seq, (long long*)&e->start,
+		  (long long*)&e->end, &e->unit) != 4)
+	die ("bad line in spec file: %s", line) ;
+      if (e->seq >= nSeq) nSeq = e->seq + 1 ;
+    }
+  fclose (specFile) ;
+  arraySort (events, eventSort) ;
+
+  /* open input sequence file */
+  SeqIO *inIO = seqIOopenRead (argv[1], dna2textConv, false) ;
+  if (!inIO) die ("failed to open %s to read as a sequence file", argv[1]) ;
+
+  /* determine output prefix */
+  char prefixBuf[1024] ;
+  if (!outPrefix)
+    { strncpy (prefixBuf, argv[1], sizeof(prefixBuf) - 20) ;
+      char *s = prefixBuf + strlen(prefixBuf) ;
+      if (s > prefixBuf+3 && !strcmp(s-3, ".gz")) { s -= 3 ; *s = 0 ; }
+      while (s > prefixBuf && *s != '.') --s ;
+      if (s == prefixBuf) s += strlen(prefixBuf) ; else *s = 0 ;
+      outPrefix = prefixBuf ;
+    }
+
+  /* open .1taco output */
+  char tacoFileName[1024] ;
+  snprintf (tacoFileName, sizeof(tacoFileName), "%s.1taco", outPrefix) ;
+  OneSchema *mapSchema = oneSchemaCreateFromText (salsaSchemaText) ;
+  OneFile *ofTaco = oneFileOpenWriteNew (tacoFileName, mapSchema, "taco", true, 1) ;
+  oneSchemaDestroy (mapSchema) ;
+  if (!ofTaco) die ("failed to open %s to write", tacoFileName) ;
+  oneAddProvenance (ofTaco, "taco", VERSION, getCommandLine()) ;
+
+  /* open .1seq output */
+  char seqFileName[1024] ;
+  snprintf (seqFileName, sizeof(seqFileName), "%s.1seq", outPrefix) ;
+  OneSchema *seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+  OneFile *ofSeq = oneFileOpenWriteNew (seqFileName, seqSchema, "seq", true, 1) ;
+  oneSchemaDestroy (seqSchema) ;
+  if (!ofSeq) die ("failed to open %s to write", seqFileName) ;
+  oneAddProvenance (ofSeq, "taco", VERSION, getCommandLine()) ;
+
+  /* optionally open FASTA output */
+  SeqIO *fastaIO = 0 ;
+  if (emitFasta)
+    { char fastaName[1024] ;
+      snprintf (fastaName, sizeof(fastaName), "%s_collapsed.fa.gz", outPrefix) ;
+      fastaIO = seqIOopenWrite (fastaName, 0, dna2textConv, 0) ;
+      if (!fastaIO) die ("failed to open %s to write", fastaName) ;
+    }
+
+  /* build seqStart lookup */
+  int i ;
+  I32 *seqStartArr = new0 (nSeq, I32) ;
+  I32 lastSeq = -1 ;
+  for (i = 0 ; i < arrayMax(events) ; ++i)
+    { I32 seq = arrp(events, i, CollapseEvent)->seq ;
+      if (seq != lastSeq) { seqStartArr[seq] = i ; lastSeq = seq ; }
+    }
+
+  Array seqLift = arrayCreate (64, SalsaEntry) ;
+
+  /* process sequences */
+  int seqIdx = 0 ;
+  while (seqIOread (inIO))
+    { I64 seqLen = inIO->seqLen ;
+      char *outBuf = new (seqLen, char) ;
+      char *inSeq = sqioSeq(inIO) ;
+      U64 nNew = 0, nOld = 0 ;
+      arrayMax(seqLift) = 0 ;
+
+      if (seqIdx < nSeq)
+	for (i = seqStartArr[seqIdx] ;
+	     i < arrayMax(events) && arrp(events,i,CollapseEvent)->seq == seqIdx ; ++i)
+	  { CollapseEvent *ce = arrp(events, i, CollapseEvent) ;
+	    if (ce->start < (I64)nOld)
+	      { if (ce->start + ce->unit > ce->end)
+		  warn ("buried event seq %d at %lld when cursor at %lld",
+			seqIdx, (long long)ce->start, (long long)nOld) ;
+		continue ;
+	      }
+	    SalsaEntry *se = arrayp (seqLift, arrayMax(seqLift), SalsaEntry) ;
+	    se->orig_start = ce->start ;
+	    se->orig_end   = ce->end ;
+	    se->taco_pos   = nNew + (ce->start - nOld) ;
+	    se->unit_len   = ce->unit ;
+	    /* no need to copy removed DNA; inSeq stays valid until end of seqIOread */
+	    memcpy (outBuf+nNew, inSeq+nOld, ce->start - nOld) ;
+	    nNew += ce->start - nOld ;
+	    if (ce->unit > 0)
+	      { memcpy (outBuf+nNew, inSeq+ce->start, ce->unit) ;
+		nNew += ce->unit ;
+	      }
+	    nOld = ce->end ;
+	  }
+
+      memcpy (outBuf+nNew, inSeq+nOld, seqLen - nOld) ;
+      nNew += seqLen - nOld ;
+
+      /* write .1taco */
+      oneInt(ofTaco,0) = seqLen ;
+      oneInt(ofTaco,1) = nNew ;
+      oneWriteLine (ofTaco, 'c', 0, 0) ;
+      oneWriteLine (ofTaco, 'I', strlen(sqioId(inIO)), sqioId(inIO)) ;
+
+      /* write .1seq: compressed sequence */
+      oneWriteLine (ofSeq, 'S', nNew, outBuf) ;
+
+      int j ;
+      for (j = 0 ; j < arrayMax(seqLift) ; ++j)
+	{ SalsaEntry *se = arrp(seqLift, j, SalsaEntry) ;
+	  oneInt(ofTaco,0) = se->orig_start ;
+	  oneInt(ofTaco,1) = se->orig_end ;
+	  oneInt(ofTaco,2) = se->taco_pos ;
+	  oneInt(ofTaco,3) = se->unit_len ;
+	  oneWriteLine (ofTaco, 'L', 0, 0) ;
+	  I64 removedLen = se->orig_end - se->orig_start - se->unit_len ;
+	  oneWriteLine (ofSeq, 'S', removedLen, inSeq + se->orig_start + se->unit_len) ;
+	}
+
+      if (fastaIO)
+	seqIOwrite (fastaIO, sqioId(inIO), inIO->descLen ? sqioDesc(inIO) : 0, nNew, outBuf, 0) ;
+
+      newFree (outBuf, seqLen, char) ;
+      ++seqIdx ;
+    }
+
+  arrayDestroy (seqLift) ;
+  if (nSeq) newFree (seqStartArr, nSeq, I32) ;
+  arrayDestroy (events) ;
+  seqIOclose (inIO) ;
+  oneFileClose (ofTaco) ;
+  oneFileClose (ofSeq) ;
+  if (fastaIO) seqIOclose (fastaIO) ;
+
+  return 0 ;
+}
+
+/****************** reconstruct subcommand ******************/
+
+static int tacoReconstruct (int argc, char *argv[])
+{
+  char *outFileName = 0 ;
+  while (argc >= 2 && **argv == '-')
+    { if (!strcmp(*argv, "-o")) { outFileName = argv[1] ; argc -= 2 ; argv += 2 ; }
+      else break ;
+    }
+
+  if (argc != 2)
+    { fprintf (stderr, "Usage: taco reconstruct [-o <output.fa>] <input.1taco> <input.1seq>\n"
+	       "  Reconstruct original FASTA from .1taco + .1seq pair.\n") ;
+      return 1 ;
+    }
+
+  /* open .1taco */
+  OneSchema *mapSchema = oneSchemaCreateFromText (salsaSchemaText) ;
+  OneFile *ofTaco = oneFileOpenRead (argv[0], mapSchema, "taco", 1) ;
+  oneSchemaDestroy (mapSchema) ;
+  if (!ofTaco) die ("failed to open %s", argv[0]) ;
+  I64 nSeq = 0 ;
+  oneStats (ofTaco, 'c', &nSeq, 0, 0) ;
+
+  /* open .1seq */
+  OneSchema *seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+  OneFile *ofSeq = oneFileOpenRead (argv[1], seqSchema, "seq", 1) ;
+  oneSchemaDestroy (seqSchema) ;
+  if (!ofSeq) die ("failed to open %s", argv[1]) ;
+
+  /* read coordinate map only (no DNA) */
+  Salsa *salsas = salsaRead (ofTaco, (int)nSeq) ;
+  oneFileClose (ofTaco) ;
+
+  /* open output */
+  if (!outFileName) outFileName = "-" ; /* stdout */
+  SeqIO *outIO = seqIOopenWrite (outFileName, 0, dna2textConv, 0) ;
+  if (!outIO) die ("failed to open %s to write", outFileName) ;
+
+  /* allocate one pair of reusable buffers sized to the largest sequence */
+  I64 maxOrigLen = 0, maxTacoLen = 0 ;
+  int i ;
+  for (i = 0 ; i < (int)nSeq ; ++i)
+    { if (salsas[i].origLen > maxOrigLen) maxOrigLen = salsas[i].origLen ;
+      if (salsas[i].tacoLen > maxTacoLen) maxTacoLen = salsas[i].tacoLen ;
+    }
+  char *tacoSeq = new (maxTacoLen + 1, char) ;
+  char *origBuf = new (maxOrigLen + 1, char) ;
+
+  /* stream through .1seq one sequence at a time: no all-at-once loading */
+  for (i = 0 ; i < (int)nSeq ; ++i)
+    { Salsa *s = &salsas[i] ;
+
+      /* read taco'd sequence -- copy out before reading removed DNA lines */
+      if (!oneReadLine (ofSeq) || ofSeq->lineType != 'S')
+	die ("expected S line for tacoSeq of sequence %d", i) ;
+      memcpy (tacoSeq, oneDNAchar(ofSeq), s->tacoLen) ;
+
+      /* reconstruct directly into origBuf, reading removed DNA on the fly */
+      I64 tacoPos = 0, origPos = 0 ;
+      int j ;
+      for (j = 0 ; j < s->n ; ++j)
+	{ SalsaEntry *e = &s->entry[j] ;
+	  I64 gap = e->taco_pos - tacoPos ;
+	  if (gap > 0)
+	    { memcpy (origBuf+origPos, tacoSeq+tacoPos, gap) ;
+	      origPos += gap ; tacoPos += gap ;
+	    }
+	  if (e->unit_len > 0)
+	    { memcpy (origBuf+origPos, tacoSeq+tacoPos, e->unit_len) ;
+	      origPos += e->unit_len ; tacoPos += e->unit_len ;
+	    }
+	  /* read removed DNA directly from .1seq into origBuf */
+	  if (!oneReadLine (ofSeq) || ofSeq->lineType != 'S')
+	    die ("expected S line for removed DNA of seq %d event %d", i, j) ;
+	  I64 removedLen = oneLen(ofSeq) ;
+	  if (removedLen > 0)
+	    { memcpy (origBuf+origPos, oneDNAchar(ofSeq), removedLen) ;
+	      origPos += removedLen ;
+	    }
+	}
+      I64 tail = s->tacoLen - tacoPos ;
+      if (tail > 0)
+	{ memcpy (origBuf+origPos, tacoSeq+tacoPos, tail) ;
+	  origPos += tail ;
+	}
+      origBuf[origPos] = 0 ;
+      seqIOwrite (outIO, s->seqName ? s->seqName : "unknown", 0, s->origLen, origBuf, 0) ;
+    }
+
+  newFree (tacoSeq, maxTacoLen + 1, char) ;
+  newFree (origBuf, maxOrigLen + 1, char) ;
+  oneFileClose (ofSeq) ;
+  seqIOclose (outIO) ;
+  salsaDestroy (salsas, (int)nSeq) ;
+  return 0 ;
+}
+
+/****************** chain subcommand ******************/
+
+static int tacoChain (int argc, char *argv[])
+{
+  char *outPrefix = 0 ;
+  while (argc >= 2 && **argv == '-')
+    { if (!strcmp(*argv, "-o")) { outPrefix = argv[1] ; argc -= 2 ; argv += 2 ; }
+      else break ;
+    }
+
+  if (argc < 4 || argc % 2 != 0)
+    { fprintf (stderr, "Usage: taco chain [-o <prefix>] <a.1taco> <a.1seq> <b.1taco> <b.1seq> [...]\n"
+	       "  Flatten multiple .1taco+.1seq layers into a single pair.\n"
+	       "  Files given in application order (a applied first, b next, etc.).\n") ;
+      return 1 ;
+    }
+
+  int nLayers = argc / 2 ;
+
+  /* read first layer */
+  OneSchema *mapSchema = oneSchemaCreateFromText (salsaSchemaText) ;
+  OneSchema *seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+
+  OneFile *ofTaco = oneFileOpenRead (argv[0], mapSchema, "taco", 1) ;
+  if (!ofTaco) die ("failed to open %s", argv[0]) ;
+  I64 nSeq = 0 ;
+  oneStats (ofTaco, 'c', &nSeq, 0, 0) ;
+  OneFile *ofSeq = oneFileOpenRead (argv[1], seqSchema, "seq", 1) ;
+  if (!ofSeq) die ("failed to open %s", argv[1]) ;
+  Salsa *current = salsaReadWithSeq (ofTaco, ofSeq, (int)nSeq) ;
+  int currentN = (int)nSeq ;
+  oneFileClose (ofTaco) ;
+  oneFileClose (ofSeq) ;
+
+  /* compose each subsequent layer */
+  int k ;
+  for (k = 1 ; k < nLayers ; ++k)
+    { oneSchemaDestroy (mapSchema) ; mapSchema = oneSchemaCreateFromText (salsaSchemaText) ;
+      oneSchemaDestroy (seqSchema) ; seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+      ofTaco = oneFileOpenRead (argv[k*2], mapSchema, "taco", 1) ;
+      if (!ofTaco) die ("failed to open %s", argv[k*2]) ;
+      I64 nSeq2 = 0 ;
+      oneStats (ofTaco, 'c', &nSeq2, 0, 0) ;
+      if (!nSeq2) oneStats (ofTaco, 's', &nSeq2, 0, 0) ;
+      if (nSeq2 != currentN) die ("sequence count mismatch: %d vs %d at layer %d", currentN, (int)nSeq2, k) ;
+      ofSeq = oneFileOpenRead (argv[k*2+1], seqSchema, "seq", 1) ;
+      if (!ofSeq) die ("failed to open %s", argv[k*2+1]) ;
+      Salsa *outer = salsaReadWithSeq (ofTaco, ofSeq, (int)nSeq2) ;
+      oneFileClose (ofTaco) ;
+      oneFileClose (ofSeq) ;
+
+      /* compose for each sequence */
+      Salsa *composed = new0 (currentN, Salsa) ;
+      int i ;
+      for (i = 0 ; i < currentN ; ++i)
+	composed[i] = salsaCompose (&current[i], &outer[i]) ;
+      salsaDestroy (current, currentN) ;
+      salsaDestroy (outer, (int)nSeq2) ;
+      current = composed ;
+    }
+  oneSchemaDestroy (mapSchema) ;
+  oneSchemaDestroy (seqSchema) ;
+
+  /* write output */
+  if (!outPrefix) outPrefix = "chained" ;
+  char tacoFileName[1024], seqFileName2[1024] ;
+  snprintf (tacoFileName, sizeof(tacoFileName), "%s.1taco", outPrefix) ;
+  snprintf (seqFileName2, sizeof(seqFileName2), "%s.1seq", outPrefix) ;
+
+  mapSchema = oneSchemaCreateFromText (salsaSchemaText) ;
+  ofTaco = oneFileOpenWriteNew (tacoFileName, mapSchema, "taco", true, 1) ;
+  oneSchemaDestroy (mapSchema) ;
+  if (!ofTaco) die ("failed to open %s to write", tacoFileName) ;
+  oneAddProvenance (ofTaco, "taco", VERSION, getCommandLine()) ;
+
+  seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+  ofSeq = oneFileOpenWriteNew (seqFileName2, seqSchema, "seq", true, 1) ;
+  oneSchemaDestroy (seqSchema) ;
+  if (!ofSeq) die ("failed to open %s to write", seqFileName2) ;
+  oneAddProvenance (ofSeq, "taco", VERSION, getCommandLine()) ;
+
+  salsaWriteWithSeq (ofTaco, ofSeq, current, currentN) ;
+  oneFileClose (ofTaco) ;
+  oneFileClose (ofSeq) ;
+  salsaDestroy (current, currentN) ;
+
+  return 0 ;
+}
+
+/****************** merge subcommand ******************/
+
+static int tacoMergeCmd (int argc, char *argv[])
+{
+  char *outPrefix = 0 ;
+  while (argc >= 2 && **argv == '-')
+    { if (!strcmp(*argv, "-o")) { outPrefix = argv[1] ; argc -= 2 ; argv += 2 ; }
+      else break ;
+    }
+
+  if (argc != 4)
+    { fprintf (stderr, "Usage: taco merge [-o <prefix>] <a.1taco> <a.1seq> <b.1taco> <b.1seq>\n"
+	       "  Merge two non-overlapping .1taco+.1seq pairs on the same original.\n") ;
+      return 1 ;
+    }
+
+  OneSchema *mapSchema = oneSchemaCreateFromText (salsaSchemaText) ;
+  OneSchema *seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+
+  /* read a */
+  OneFile *ofTaco = oneFileOpenRead (argv[0], mapSchema, "taco", 1) ;
+  if (!ofTaco) die ("failed to open %s", argv[0]) ;
+  I64 nSeqA = 0 ;
+  oneStats (ofTaco, 'c', &nSeqA, 0, 0) ;
+  if (!nSeqA) oneStats (ofTaco, 's', &nSeqA, 0, 0) ;
+  OneFile *ofSeq = oneFileOpenRead (argv[1], seqSchema, "seq", 1) ;
+  if (!ofSeq) die ("failed to open %s", argv[1]) ;
+  Salsa *sA = salsaReadWithSeq (ofTaco, ofSeq, (int)nSeqA) ;
+  oneFileClose (ofTaco) ;
+  oneFileClose (ofSeq) ;
+
+  /* read b */
+  oneSchemaDestroy (mapSchema) ; mapSchema = oneSchemaCreateFromText (salsaSchemaText) ;
+  oneSchemaDestroy (seqSchema) ; seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+  ofTaco = oneFileOpenRead (argv[2], mapSchema, "taco", 1) ;
+  if (!ofTaco) die ("failed to open %s", argv[2]) ;
+  I64 nSeqB = 0 ;
+  oneStats (ofTaco, 'c', &nSeqB, 0, 0) ;
+  if (!nSeqB) oneStats (ofTaco, 's', &nSeqB, 0, 0) ;
+  if (nSeqA != nSeqB) die ("sequence count mismatch: %d vs %d", (int)nSeqA, (int)nSeqB) ;
+  ofSeq = oneFileOpenRead (argv[3], seqSchema, "seq", 1) ;
+  if (!ofSeq) die ("failed to open %s", argv[3]) ;
+  Salsa *sB = salsaReadWithSeq (ofTaco, ofSeq, (int)nSeqB) ;
+  oneFileClose (ofTaco) ;
+  oneFileClose (ofSeq) ;
+  oneSchemaDestroy (mapSchema) ;
+  oneSchemaDestroy (seqSchema) ;
+
+  /* merge */
+  Salsa *merged = new0 ((int)nSeqA, Salsa) ;
+  int i ;
+  for (i = 0 ; i < (int)nSeqA ; ++i)
+    merged[i] = salsaMerge (&sA[i], &sB[i]) ;
+  salsaDestroy (sA, (int)nSeqA) ;
+  salsaDestroy (sB, (int)nSeqB) ;
+
+  /* write output */
+  if (!outPrefix) outPrefix = "merged" ;
+  char tacoFileName[1024], seqFileName2[1024] ;
+  snprintf (tacoFileName, sizeof(tacoFileName), "%s.1taco", outPrefix) ;
+  snprintf (seqFileName2, sizeof(seqFileName2), "%s.1seq", outPrefix) ;
+
+  mapSchema = oneSchemaCreateFromText (salsaSchemaText) ;
+  ofTaco = oneFileOpenWriteNew (tacoFileName, mapSchema, "taco", true, 1) ;
+  oneSchemaDestroy (mapSchema) ;
+  oneAddProvenance (ofTaco, "taco", VERSION, getCommandLine()) ;
+
+  seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+  ofSeq = oneFileOpenWriteNew (seqFileName2, seqSchema, "seq", true, 1) ;
+  oneSchemaDestroy (seqSchema) ;
+  oneAddProvenance (ofSeq, "taco", VERSION, getCommandLine()) ;
+
+  salsaWriteWithSeq (ofTaco, ofSeq, merged, (int)nSeqA) ;
+  oneFileClose (ofTaco) ;
+  oneFileClose (ofSeq) ;
+  salsaDestroy (merged, (int)nSeqA) ;
+
+  return 0 ;
+}
+
+/****************** lift subcommand ******************/
+
+static int tacoLift (int argc, char *argv[])
+{
+  bool reverse = false ;
+  while (argc >= 1 && **argv == '-')
+    { if (!strcmp(*argv, "-r")) { reverse = true ; --argc ; ++argv ; }
+      else break ;
+    }
+
+  if (argc < 2)
+    { fprintf (stderr, "Usage: taco lift [-r] <annotations.bed> <map.1taco> [map2.1taco ...]\n"
+	       "  default: final -> original (lift collapsed coords back to original)\n"
+	       "  -r: original -> final (project original coords to collapsed space)\n"
+	       "  annotations.bed: tab-separated: seq_index start end [extra columns...]\n"
+	       "  .1taco files in round order (round 0 first)\n") ;
+      return 1 ;
+    }
+
+  char *bedFile = argv[0] ;
+  int nMaps = argc - 1 ;
+  char **mapFiles = argv + 1 ;
+
+  /* load the salsa stack */
+  SalsaStack *stack = salsaStackLoad (mapFiles, nMaps) ;
+
+  /* process annotations */
+  FILE *fp = strcmp(bedFile, "-") ? fopen (bedFile, "r") : stdin ;
+  if (!fp) die ("failed to open %s", bedFile) ;
+
+  char line[4096] ;
+  while (fgets (line, sizeof(line), fp))
+    { if (line[0] == '#' || line[0] == '\n')
+	{ fputs (line, stdout) ;
+	  continue ;
+	}
+      int seq ;
+      long long start, end ;
+      int nParsed ;
+      char *rest = 0 ;
+
+      if (sscanf (line, "%d\t%lld\t%lld%n", &seq, &start, &end, &nParsed) < 3)
+	{ fprintf (stderr, "warning: skipping unparseable line: %s", line) ;
+	  continue ;
+	}
+      rest = line + nParsed ;
+
+      I64 oa, ob ;
+      if (reverse)
+	salsaStackOrigToFinalInterval (stack, seq, (I64)start, (I64)end, &oa, &ob) ;
+      else
+	salsaStackFinalToOrigInterval (stack, seq, (I64)start, (I64)end, &oa, &ob) ;
+
+      printf ("%d\t%lld\t%lld", seq, (long long)oa, (long long)ob) ;
+      if (rest && *rest) fputs (rest, stdout) ;
+      else putchar ('\n') ;
+    }
+
+  if (fp != stdin) fclose (fp) ;
+  salsaStackDestroy (stack) ;
+
+  return 0 ;
+}
+
+/****************** info subcommand ******************/
+
+static int tacoInfo (int argc, char *argv[])
+{
+  if (argc != 1)
+    { fprintf (stderr, "Usage: taco info <input.1taco>\n"
+	       "  Print summary statistics of a .1taco file.\n") ;
+      return 1 ;
+    }
+
+  OneSchema *schema = oneSchemaCreateFromText (salsaSchemaText) ;
+  OneFile *of = oneFileOpenRead (argv[0], schema, "taco", 1) ;
+  oneSchemaDestroy (schema) ;
+  if (!of) die ("failed to open %s", argv[0]) ;
+
+  I64 nSeq = 0, nEvents = 0 ;
+  oneStats (of, 'c', &nSeq, 0, 0) ;
+  oneStats (of, 'L', &nEvents, 0, 0) ;
+
+  printf ("File: %s\n", argv[0]) ;
+  printf ("Sequences: %lld\n", (long long)nSeq) ;
+  printf ("Lift events: %lld\n", (long long)nEvents) ;
+
+  /* read and print per-sequence details */
+  Salsa *salsas = salsaRead (of, (int)nSeq) ;
+  oneFileClose (of) ;
+
+  I64 totOrig = 0, totTaco = 0, totRemoved = 0 ;
+  int i, j ;
+  for (i = 0 ; i < (int)nSeq ; ++i)
+    { Salsa *s = &salsas[i] ;
+      printf ("  seq %d", i) ;
+      if (s->seqName) printf (" (%s)", s->seqName) ;
+      printf (": origLen=%lld tacoLen=%lld events=%d compression=%.1f%%\n",
+	      (long long)s->origLen, (long long)s->tacoLen, s->n,
+	      s->origLen > 0 ? 100.0 * (1.0 - (double)s->tacoLen / s->origLen) : 0.0) ;
+      totOrig += s->origLen ;
+      totTaco += s->tacoLen ;
+      for (j = 0 ; j < s->n ; ++j)
+	totRemoved += s->entry[j].orig_end - s->entry[j].orig_start - s->entry[j].unit_len ;
+    }
+  printf ("Total: origLen=%lld tacoLen=%lld removed=%lld compression=%.1f%%\n",
+	  (long long)totOrig, (long long)totTaco, (long long)totRemoved,
+	  totOrig > 0 ? 100.0 * (1.0 - (double)totTaco / totOrig) : 0.0) ;
+
+  salsaDestroy (salsas, (int)nSeq) ;
+  return 0 ;
+}
+
+/****************** main dispatcher ******************/
+
+int main (int argc, char *argv[])
+{
+  storeCommandLine (argc, argv) ;
+  --argc ; ++argv ;
+
+  if (argc < 1)
+    { fprintf (stderr,
+	       "Usage: taco <subcommand> [options] [args...]\n"
+	       "\n"
+	       "Subcommands:\n"
+	       "  compress     .1aln + FASTA -> .1taco + .1seq (tandem compression)\n"
+	       "  collapse     TSV spec + FASTA -> .1taco + .1seq (generic collapse)\n"
+	       "  reconstruct  .1taco + .1seq -> FASTA (inverse / undo)\n"
+	       "  chain        flatten multiple .1taco + .1seq layers into one\n"
+	       "  merge        merge non-overlapping .1taco + .1seq on same original\n"
+	       "  lift         coordinate liftover through .1taco file(s)\n"
+	       "  info         print summary of .1taco file\n") ;
+      return 1 ;
+    }
+
+  if      (!strcmp(argv[0], "compress"))    return tacoCompress    (argc-1, argv+1) ;
+  else if (!strcmp(argv[0], "collapse"))    return tacoCollapse    (argc-1, argv+1) ;
+  else if (!strcmp(argv[0], "reconstruct")) return tacoReconstruct (argc-1, argv+1) ;
+  else if (!strcmp(argv[0], "chain"))       return tacoChain       (argc-1, argv+1) ;
+  else if (!strcmp(argv[0], "merge"))       return tacoMergeCmd    (argc-1, argv+1) ;
+  else if (!strcmp(argv[0], "lift"))        return tacoLift        (argc-1, argv+1) ;
+  else if (!strcmp(argv[0], "info"))        return tacoInfo        (argc-1, argv+1) ;
+  else
+    { fprintf (stderr, "Unknown subcommand: %s\n", argv[0]) ;
+      return 1 ;
+    }
 }
