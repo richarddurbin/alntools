@@ -26,7 +26,9 @@ static char schemaText[] =
   "O S 1 6 STRING                      id for a scaffold\n"
   "D G 1 3 INT                         gap of given length\n"
   "D C 1 3 INT                         contig of given length\n"
+#ifdef GDB_MASK
   "D M 1 8 INT_LIST                    mask pair list for a contig\n"
+#endif
   ".\n"
   "P 3 seq                     SEQUENCE\n"
   "O s 2 3 INT 6 STRING        length and id for group of sequences = a scaffold\n"
@@ -37,13 +39,13 @@ static char schemaText[] =
   ".\n"
   "P 3 aln                     ALIGNMENTS\n"
   "D t 1 3 INT                 trace point spacing in a - global\n"
-  ".                           GDB skeleton (may not be presend)\n"
+  ".                           GDB skeleton (may not be present)\n"
   "O g 0                       groups scaffolds into a GDB skeleton\n"
   "G S                         collection of scaffolds constituting a GDB\n"
   "O S 1 6 STRING              id for a scaffold\n"
   "D G 1 3 INT                 gap of given length\n"
   "D C 1 3 INT                 contig of given length\n"
-  "D M 1 8 INT_LIST            mask pair list for a contig\n"
+  //"D M 1 8 INT_LIST            mask pair list for a contig\n"
   ".\n"
   "O a 0                       groups A's into a colinear chain\n"
   "G A                         chains (a) group alignment objects (A)\n"
@@ -59,6 +61,18 @@ static char schemaText[] =
   "D E 1 3 INT                 match: number of equal bases (currently unused)\n"
   "D Z 1 6 STRING              cigar string: encodes precise alignment (currently unused)\n"
   "D U 1 3 INT                 putative unit size of a TR alignment (FASTAN)\n"
+  ".\n"
+  "P 3 ano                     ANNOTATIONS (like bed files)\n"
+  "O g 0                       groups scaffolds into a GDB skeleton\n"
+  "G S                         collection of scaffolds constituting a GDB\n"
+  "O S 1 6 STRING              id for a scaffold\n"
+  "D G 1 3 INT                 gap of given length\n"
+  "D C 1 3 INT                 contig of given length\n"
+  ".\n"
+  "O M 3 3 INT 3 INT 3 INT     scaffold index, beg,end pair\n"
+  "D L 1 6 STRING              optional label for preceeding M\n"
+  "D X 1 3 INT                 optional score for the preceeding M\n"
+  "D P 1 8 INT_LIST            optional partitioning of the preceeding M\n"
 ;
 
 typedef struct {
@@ -66,16 +80,19 @@ typedef struct {
   double fA, fC, fG, fT ;	// 'f' frequences of A,C,G,T
   bool   isUpper ;	 	// 'u' upper case for non-masked sequence
   int    nSeq, nCtg, nGap ;
-  I64    maxSeq, maxCtg, maxMask ; // used to allocate arrays below
-  I64    totSeq, totCtg, totMask ; // total length including gaps, without gaps, of mask
+  I64    maxSeq, totSeq ;       // max and total length of sequences
+  I64    maxCtg, totCtg ;       // max and total length of contigs
   DICT  *seqDict ;       	// names of sequences
   I64   *seqLen ;	 	// lengths of sequences
   I64   *ctgLen ;	 	// contig lengths
   int   *ctgSeq ;	 	// parent sequence for each contig
   I64   *ctgPos ;	 	// offset in parent of each contig
+#ifdef GDB_MASK
+  I64    maxMask, totMask ;  // max and total length of masks
   int   *ctgMaskCount ;  	// number of masks in each contig
   int   *ctgMaskStart ;         // start of contigs's mask entries in ->mask
   I64   *mask ;		 	// mask positions (two per masked region)
+#endif
 } Gdb ;
 
 static inline int ctg2seq (Gdb *gdb, int ctg) { return gdb->ctgSeq[ctg] ; }

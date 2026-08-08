@@ -16,9 +16,11 @@ void reportGdb (Gdb *gdb, FILE *f)
 { fprintf (f, "%d seqs %d contigs (%d gaps)", gdb->nSeq, gdb->nCtg, gdb->nGap) ;
   fprintf (f, ", totSeq %lld totCtg %lld (%.3f%%)", (long long) gdb->totSeq,
 	   (long long) gdb->totCtg, gdb->totCtg/(0.01*gdb->totSeq)) ;
+ #ifdef GDB_MASK
   if (gdb->totMask)
     fprintf (f, ", %d masks totMask %lld (%.1f%%)",
-	     (int) gdb->maxMask/2, (long long) gdb->totMask, gdb->totMask/(0.01*gdb->totSeq)) ;
+  	     (int) gdb->maxMask/2, (long long) gdb->totMask, gdb->totMask/(0.01*gdb->totSeq)) ;
+#endif
   fputc ('\n', f) ;
 }
 
@@ -33,17 +35,19 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) // don't report if !report
   
   oneStats (of, 'S', &gdb->maxSeq, 0, 0) ;
   oneStats (of, 'C', &gdb->maxCtg, 0, 0) ;
-  oneStats (of, 'M', 0, 0, &gdb->maxMask) ;
   gdb->seqDict = dictCreate (gdb->maxSeq) ;
   gdb->seqLen = new0 (gdb->maxSeq, I64) ;
   gdb->ctgLen = new0 (gdb->maxCtg, I64) ;
   gdb->ctgSeq = new0 (gdb->maxCtg, int) ;
   gdb->ctgPos = new0 (gdb->maxCtg, I64) ;
-  if (gdb->maxMask)
+ #ifdef GDB_MASK
+   oneStats (of, 'M', 0, 0, &gdb->maxMask) ;
+   if (gdb->maxMask)
     { gdb->ctgMaskCount = new0 (gdb->maxCtg, int) ;
       gdb->ctgMaskStart = new0 (gdb->maxCtg, int) ;
       gdb->mask = new0 (gdb->maxMask, I64) ;
     }
+ #endif
 
   if (!strcmp (of->fileType, "gdb"))	// stand alone
     oneGoto (of, 'S', 0) ; 		// go to the start of the data
@@ -88,6 +92,7 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) // don't report if !report
 	gdb->totCtg += oneInt(of,0) ;
 	++gdb->nCtg ;
 	break ;
+#ifdef GDB_MASK     
       case 'M':
 	if (!gdb->nCtg) die ("M line before C line in GDB") ;
 	if (oneLen(of) % 2) die ("size of Mask list must be even") ;
@@ -99,6 +104,7 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) // don't report if !report
 	I64 *m = oneIntList(of) ;
 	for (i = 0 ; i < oneLen(of) ; i += 2) gdb->totMask += m[i+1] - m[i] ;
 	break ;
+#endif
       default: // anything else (including another 'g') is the end of this GDB
 	isDone = true ;
 	break ;
@@ -141,8 +147,10 @@ void writeGdb (OneFile *of, Gdb *gdb, int k, FILE *report)
 	  oneInt(of,0) = gdb->ctgLen[j] ;
 	  oneWriteLine (of, 'C', 0, 0) ;
 	  end += gdb->ctgLen[j] ;
+#ifdef GDB_MASK     
 	  if (gdb->totMask && gdb->ctgMaskCount[j])
 	    oneWriteLine (of, 'M', gdb->ctgMaskCount[j], &gdb->mask[gdb->ctgMaskStart[j]]) ;
+#endif
 	  ++j ;
 	}
       if (end < gdb->seqLen[i])
@@ -165,11 +173,13 @@ void gdbDestroy (Gdb *gdb)
   newFree (gdb->ctgLen, gdb->maxCtg, I64) ;
   newFree (gdb->ctgSeq, gdb->maxCtg, int) ;
   newFree (gdb->ctgPos, gdb->maxCtg, I64) ;
+#ifdef GDB_MASK
   if (gdb->maxMask)
     { newFree (gdb->ctgMaskCount, gdb->maxCtg, int) ;
       newFree (gdb->ctgMaskStart, gdb->maxCtg, int) ;
       newFree (gdb->mask, gdb->maxMask, I64) ;
     }
+#endif
   newFree (gdb, 1, Gdb) ;
 }
 
