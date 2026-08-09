@@ -1376,8 +1376,8 @@ OneFile *oneFileOpenRead (const char *path, OneSchema *vsArg, const char *fileTy
     else
       { f = fopen (path, "r");
 	if (!f && fileType)
-	  { char *localPath = malloc (strlen(path) + strlen(fileType) + 2) ;
-	    strcpy (localPath, path) ; strcat (localPath, ".") ; strcat (localPath, fileType) ;
+	  { char *localPath = malloc (strlen(path) + strlen(fileType) + 3) ;
+	    strcpy (localPath, path) ; strcat (localPath, ".1") ; strcat (localPath, fileType) ;
 	    f = fopen (localPath, "r") ;
 	  }
 	if (!f) return 0 ;
