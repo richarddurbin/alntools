@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Mar  5 19:22 2026 (rd109)
+ * Last edited: Aug 10 15:24 2026 (rd109)
  * Created: Sun Oct 19 21:45:26 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -240,7 +240,7 @@ int main (int argc, char *argv[])
       bl = arrayp (ab, arrayMax(ab), TanLine) ;
     }
   --arrayMax(ab) ;
-  arraySort (ab, tanSort) ; // need to ensure it is sorted
+  arraySort (ab, tanLineCompareSeq) ; // need to ensure it is sorted
   fprintf (stdout, "read %lld bed lines from %s\n", (long long)arrayMax(ab), argv[1]) ;
   fclose (f) ;
 

@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Nov 16 10:18 2025 (rd109)
+ * Last edited: Aug 10 13:08 2026 (rd109)
  * Created: Thu Oct 16 02:49:56 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -101,14 +101,21 @@ static inline I64 ctg2pos (Gdb *gdb, int ctg, I64 x) { return gdb->ctgPos[ctg] +
 /****************** BED file structures ***********************/
 
 typedef struct {
-  U32 seq ;          // for bed output need seq
-  int ctg ;          // for masking need contig
-  I64 start, end ;
-  int unit ;
-  int score ;
+  U32   seq ;          // for bed output need seq
+  union {
+    int ctg ;          // for masking need contig
+    int count ;        // for tancons need count of correct-length units
+  } ;
+  I64   start, end ;
+  int   unit ;
+  int   score ;
+  union {
+    char *consensus ;
+    I64  *starts ;
+  } ;
 } TanLine ;
 
-static int tanSort (const void *a, const void *b)
+static int tanLineCompareSeq (const void *a, const void *b)
 {
   TanLine *ta = (TanLine*)a, *tb = (TanLine*)b ;
   if (ta->seq != tb->seq) return ta->seq - tb->seq ;
