@@ -5,7 +5,7 @@
  * Description: TAndem COmpressor
  * Exported functions:
  * HISTORY:
- * Last edited: Nov 16 12:57 2025 (rd109)
+ * Last edited: Aug 10 15:22 2026 (rd109)
  * Created: Sat Nov 15 23:37:43 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -26,7 +26,7 @@ int main (int argc, char *argv[])
     { fprintf (stderr, "Usage: taco [-o <outFileName>] <input.1aln> <seqFile>\n"
 	       "  taco stands for 'TAndem COmpress (cf hoco for 'HOmopolymer COmpress'\n"
 	       "  input.1aln should be created by FasTAN and the names and lengths must match to seqFile\n"
-	       "  default outFileName is <seqFile-stem>-taco.1seq;"
+	       "  default outFileName is <seqFile-stem>-taco.fa.gz;"
 	       "  user given outFileName can end in .fa or .fa.gz or .1seq\n") ;
       exit (1) ;
     }
@@ -43,8 +43,10 @@ int main (int argc, char *argv[])
   if (!inIO) die ("failed to open %s to read as a sequence file", argv[1]) ;
 
   // and the output file
+  int outSize = 0 ;
   if (!outFileName)
-    { outFileName = new0 (strlen(argv[1]) + 10, char) ;
+    { outSize = strlen(argv[1]) + 10 ;
+      outFileName = new0 (outSize, char) ;
       strcpy (outFileName, argv[1]) ;
       char *s = outFileName ; while (*s) ++s ;
       if (s > outFileName+3 && !strcmp(s-3, ".gz")) { s -= 3 ; *s = 0 ; } // remove ".gz"
@@ -75,7 +77,7 @@ int main (int argc, char *argv[])
 	else if (ofIn->lineType == 'U') t->unit = oneInt(ofIn,0) ;
     }
   oneFileClose (ofIn) ;
-  arraySort (at, tanSort) ;
+  arraySort (at, tanLineCompareSeq) ;
 
   // now build a lookup from the sequence name to start position in at
   int i ;
@@ -97,13 +99,13 @@ int main (int argc, char *argv[])
   while (seqIOread (inIO))
     { U32 seq ;
       char *id = sqioId(inIO) ;
-      if (inIO->descLen) // need to deal with Gene including the description in the ID
-	{ id = malloc (strlen(id) + strlen(sqioDesc(inIO)) + 2) ;
-	  sprintf (id, "%s %s", sqioId(inIO), sqioDesc(inIO)) ;
-	}
+      //      if (inIO->descLen) // need to deal with Gene including the description in the ID
+      //	{ id = malloc (strlen(id) + strlen(sqioDesc(inIO)) + 2) ;
+      //	  sprintf (id, "%s %s", sqioId(inIO), sqioDesc(inIO)) ;
+      //	}
       if (!dictFind (gdb->seqDict, id, &seq))
-	die ("failed to match name %s in %s to %s", sqioId(inIO), argv[1], argv[0]) ;
-      if (id != sqioId(inIO)) free (id) ;
+	die ("failed to match name %s in %s to %s", id, argv[1], argv[0]) ;
+      // if (id != sqioId(inIO)) free (id) ;
       if (inIO->seqLen != gdb->seqLen[seq])
 	die ("length mismatch for seq %s: %d in %s, %d in %s",
 	     sqioId(inIO), gdb->seqLen[seq], argv[0], inIO->seqLen, argv[1]) ;
@@ -136,7 +138,7 @@ int main (int argc, char *argv[])
   gdbDestroy (gdb) ;
   seqIOclose (inIO) ;
   seqIOclose (outIO) ;
-  if (outFileName != argv[1]) newFree (outFileName, strlen(argv[1]) + 10, char) ;
+  if (outSize) newFree (outFileName, outSize, char) ;
   
   return 0 ;
 }

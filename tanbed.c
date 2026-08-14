@@ -6,7 +6,7 @@
  * Description: make a bed file from a FasTAN .1aln file
  * Exported functions:
  * HISTORY:
- * Last edited: Nov 16 10:12 2025 (rd109)
+ * Last edited: Aug 10 12:45 2026 (rd109)
  * Created: Thu Oct 16 02:48:43 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -44,7 +44,7 @@ int main (int argc, char *argv[])
 	else if (of->lineType == 'U') b->unit = oneInt(of,0) ;
     }
   oneFileClose (of) ;
-  arraySort (ab, tanSort) ;
+  arraySort (ab, tanLineCompareSeq) ;
 
   int i ;
   for (i = 0 ; i < arrayMax(ab) ; ++i)
