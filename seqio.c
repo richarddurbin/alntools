@@ -5,7 +5,8 @@
  * Description: buffered package to read arbitrary sequence files - much faster than readseq
  * Exported functions:
  * HISTORY:
- * Last edited: Nov 23 19:16 2024 (rd109)
+ * Last edited: Aug 25 19:06 2026 (rd109)
+ * * Aug 25 19:05 2026 (rd109): Claude added gzreadU64()
  * * Dec 15 09:45 2022 (rd109): separated out 2bit packing/unpacking into SeqPack
  * Created: Fri Nov  9 00:21:21 2018 (rd109)
  *-------------------------------------------------------------------
@@ -28,6 +29,8 @@ void bamFileClose (SeqIO *si) ;
 // global
 char* seqIOtypeName[] = { "unknown", "fasta", "fastq", "binary", "onecode", "bam" } ;
 
+static U64 gzreadU64 (gzFile gzf, char *buf, U64 len) ; /* defined below: gzread() is limited to <2^31 bytes per call */
+
 SeqIO *seqIOopenRead (char *filename, int* convert, bool isQual)
 {
   SeqIO *si = new0 (1, SeqIO) ;
@@ -38,7 +41,7 @@ SeqIO *seqIOopenRead (char *filename, int* convert, bool isQual)
   si->b = si->buf = new (si->bufSize, char) ;
   si->convert = convert ;
   si->isQual = isQual ;
-  si->nb = gzread (si->gzf, si->buf, si->bufSize) ;
+  si->nb = gzreadU64 (si->gzf, si->buf, si->bufSize) ;
   if (!si->nb)
     { fprintf (stderr, "sequence file %s unreadable or empty\n", filename) ;
       seqIOclose (si) ;
@@ -95,7 +98,7 @@ SeqIO *seqIOopenRead (char *filename, int* convert, bool isQual)
 	  { maxBufSize = ((maxBufSize >> 20) + 1) << 20 ; /* so a clean number of megabytes */
 	    char *newBuf = new (maxBufSize, char) ; memcpy (newBuf, si->b, si->nb) ;
 	    si->b = si->buf = newBuf ; si->bufSize = maxBufSize ;
-	    si->nb += gzread (si->gzf, si->b + si->nb, si->bufSize - si->nb) ;
+	    si->nb += gzreadU64 (si->gzf, si->b + si->nb, si->bufSize - si->nb) ;
 	  }
       }
     }
@@ -179,14 +182,31 @@ void seqIOclose (SeqIO *si)
 }
 
 /********** local routines for seqIOread() ***********/
- 
+
+/* gzread() takes/returns a 32-bit signed int: if asked for len >= 2^31 bytes it reads
+   nothing and returns -1 (see zlib.h), which callers here would otherwise sign-extend
+   into si->nb (U64) as a huge bogus byte count.  This wrapper loops in <2^31 chunks so
+   any request size is handled safely, however large a single buffer/sequence gets. */
+static U64 gzreadU64 (gzFile gzf, char *buf, U64 len)
+{
+  U64 nRead = 0 ;
+  while (nRead < len)
+    { unsigned chunk = (len - nRead > 0x7fffffff) ? 0x7fffffff : (unsigned)(len - nRead) ;
+      int n = gzread (gzf, buf + nRead, chunk) ;
+      if (n < 0) die ("gzread failed: %s", gzerror (gzf, 0)) ;
+      nRead += n ;
+      if ((unsigned)n < chunk) break ; /* short read: EOF (or a concurrently-written file) */
+    }
+  return nRead ;
+}
+
 static void bufRefill (SeqIO *si)
 { si->b -= si->recStart ;		/* will be position after move */
   memmove (si->buf, si->buf + si->recStart, si->b - si->buf) ;
   si->idStart -= si->recStart ; si->descStart -= si->recStart ; /* adjust all the offsets */
   si->seqStart -= si->recStart ; si->qualStart -= si->recStart ;
   si->recStart = 0 ;
-  si->nb = gzread (si->gzf, si->b, si->buf + si->bufSize - si->b) ;
+  si->nb = gzreadU64 (si->gzf, si->b, si->buf + si->bufSize - si->b) ;
 }
 
 static void bufDouble (SeqIO *si)
@@ -195,7 +215,7 @@ static void bufDouble (SeqIO *si)
   memcpy (newbuf, si->buf, si->bufSize) ;
   si->b = newbuf + si->bufSize ; si->nb = si->bufSize ; /* rely on being at end of old buf */
   free (si->buf) ; si->buf = newbuf ;
-  si->nb = gzread (si->gzf, si->b, si->bufSize) ;
+  si->nb = gzreadU64 (si->gzf, si->b, si->bufSize) ;
   si->bufSize *= 2 ;
 }
 
@@ -218,7 +238,7 @@ static void bufHardRefill (SeqIO *si, U64 n) /* like bufRefill() but for bufConf
   si->b -= si->recStart ;		/* will be position after move */
   memmove (si->buf, si->buf + si->recStart, si->b - si->buf) ;
   si->recStart = 0 ; si->b = si->buf ;
-  si->nb += gzread (si->gzf, si->b + si->nb, si->bufSize - si->nb) ;
+  si->nb += gzreadU64 (si->gzf, si->b + si->nb, si->bufSize - si->nb) ;
   if (si->nb < n) die ("incomplete sequence record %llu", si->line) ;
 }
 
