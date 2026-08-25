@@ -13,7 +13,7 @@
  *   - satmatch(): main alignment routine
  *
  * HISTORY:
- * Last edited: Aug 25 16:59 2026 (rd109)
+ * Last edited: Aug 25 19:14 2026 (rd109)
  * Created: Tue Aug 11 08:32:53 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -169,19 +169,6 @@ int main (int argc, char *argv[])
     }
   
   if (!(argc == 1 || (nRandom > 0 && argc == 0))) die (usage) ;
-
-  // estimate significance threshold
-  double threshFac ;
-  { static int NSEQ = 40, LEN = 100 ;
-    Array a = randomSeqs (NSEQ, LEN) ;
-    int sum = 0 ;
-    for (int i = 0 ; i < NSEQ ; ++i)
-      for (int j = i+1 ; j < NSEQ ; ++j)
-	sum += needlemanWunsch (arrp(a,i,Seq), arrp(a,j,Seq), &scoreParams, 0) ;
-    seqArrayDestroy (a) ;
-    threshFac = 0.9 * 0.01 * sum * 2.0 / (NSEQ*(NSEQ-1)) ; // a hack, but seems good
-    fprintf (stderr, "threshold %.3f\n", threshFac) ;
-  }
    
   Array aSeq ; 
   int totSeq = 0 ;
@@ -203,10 +190,47 @@ int main (int argc, char *argv[])
 	}
       seqIOclose (sio) ;
     }
-  
   fprintf (stderr, "%d sequences, total length %d\n", (int)arrayMax(aSeq), totSeq) ;
-
   int nSeq = arrayMax(aSeq) ;
+
+  // precluster the sequences based on composition
+  // then for each cluster construct the mean and calculate a score threshold
+  int *tClus = new0 (nSeq, int) ;
+  int nTclus = 0 ;
+  int *freq  = new0 (nSeq*4, int) ;
+  for (int i = 0 ; i < nSeq ; ++i)
+    { Seq *s = arrp (aSeq, i, Seq) ;
+      int *f = freq + 4*i ;
+      for (int j = 0 ; j < s->len ; ++j) ++f[s->seq[j]] ;
+      if (f[0]+f[1] > f[2]+f[3]) // swap AC and TG
+	{ int t = f[0] ; f[0] = f[3] ; f[3] = t ; t = f[1] ; f[1] = f[2] ; f[2] = t ; }
+      for (int k = 0 ; k < i ; ++k)
+	{ int *g = freq + 4*k ;
+	  int sum2 = (f[0]-g[0])*(f[0]-g[0]) + (f[1]-g[1])*(f[1]-g[1]) +
+	    (f[2]-g[2])*(f[2]-g[2]) + (f[3]-g[3])*(f[3]-g[3]) ;
+	  if (sum2 <= 2*(s->len + arrp(aSeq,k,Seq)->len))
+	    { tClus[i] = tClus[k] ;
+	      break ;
+	    }
+	  if (!tClus[i]) tClus[i] = ++nTclus ;
+	}
+    }
+  fprintf (stderr, "found %d frequency-based clusters\n", nTclus) ;
+
+  // estimate significance threshold
+  double threshFac ;
+  { static int NSEQ = 40, LEN = 100 ;
+    Array a = randomSeqs (NSEQ, LEN) ;
+    int sum = 0 ;
+    for (int i = 0 ; i < NSEQ ; ++i)
+      for (int j = i+1 ; j < NSEQ ; ++j)
+	sum += needlemanWunsch (arrp(a,i,Seq), arrp(a,j,Seq), &scoreParams, 0) ;
+    seqArrayDestroy (a) ;
+    threshFac = 0.75 * 0.01 * sum * 2.0 / (NSEQ*(NSEQ-1)) ; // a hack, but seems good
+    fprintf (stderr, "threshold %.3f\n", threshFac) ;
+  }
+  
+  // now go through comparing the sequences
   int *mark = new0 (nSeq, int) ;
   int *scoreij = new0 (nSeq*nSeq, int) ;
   int nMark = 0 ;
@@ -303,7 +327,8 @@ int main (int argc, char *argv[])
 	    printf ("  %s\t%d\t%d\n", s->name, s->len, scoreij[i*nSeq+iMinSum]) ;
 	  }
     }
- 
+
+  newFree (mark, nSeq, int) ;
   if (fastaFile) fclose (fastaFile) ;
   if (scoreFile) fclose (scoreFile) ;
   seqArrayDestroy (aSeq) ;
