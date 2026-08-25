@@ -13,7 +13,7 @@
  *   - satmatch(): main alignment routine
  *
  * HISTORY:
- * Last edited: Aug 14 16:08 2026 (rd109)
+ * Last edited: Aug 25 15:50 2026 (rd109)
  * Created: Tue Aug 11 08:32:53 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -269,7 +269,7 @@ int main (int argc, char *argv[])
 	  sumScore[j] += scoreij[i*nSeq+j] ;
 	}
 
-  for (int k = 1 ; k < nMark ; ++k)
+  for (int k = 1 ; k <= nMark ; ++k)
     { int count = 0, minLen = 1<<30, minSum = 1<<30, iMinSum = -1 ;
       for (int i = 0 ; i < nSeq ; ++i)
 	if (mark[i] == k)
