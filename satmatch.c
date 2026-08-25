@@ -13,7 +13,7 @@
  *   - satmatch(): main alignment routine
  *
  * HISTORY:
- * Last edited: Aug 25 15:50 2026 (rd109)
+ * Last edited: Aug 25 16:59 2026 (rd109)
  * Created: Tue Aug 11 08:32:53 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -130,12 +130,12 @@ int main (int argc, char *argv[])
 
   /* Process command line options */
   while (argc > 1 && **argv == '-')
-    { if (!strcmp (*argv, "-sf"))
+    { if (!strcmp (*argv, "-sf") && argc > 1)
         { if (!(scoreFile = fopen (*++argv, "w")))
             { fprintf (stderr, "failed to open output file %s\n", *argv) ;
               exit (1) ;
             }
-          argc-- ; argv++ ;
+          argc-- ;
         }
       else if (!strcmp (*argv, "-ti") && argc > 1)
         { scoreParams.transition = atoi (*++argv) ;
@@ -210,7 +210,7 @@ int main (int argc, char *argv[])
   int *mark = new0 (nSeq, int) ;
   int *scoreij = new0 (nSeq*nSeq, int) ;
   int nMark = 0 ;
-  if (scoreFile) fprintf (scoreFile, "#seq1\tlen1\tseq2\tlen2\tscore\n") ;
+  if (scoreFile) fprintf (scoreFile, "#seq1\tlen1\tseq2\tlen2\tscore\torientation\toffset\n") ;
   for (int i = 0 ; i < nSeq ; i++)
     for (int j = i+1 ; j < nSeq ; j++)
       { Seq *si = arrp(aSeq,i,Seq) ;
@@ -304,7 +304,8 @@ int main (int argc, char *argv[])
 	  }
     }
  
-  if (fastaFile) fclose(fastaFile) ;
+  if (fastaFile) fclose (fastaFile) ;
+  if (scoreFile) fclose (scoreFile) ;
   seqArrayDestroy (aSeq) ;
   timeTotal (stderr) ;
   return 0 ;
