@@ -5,7 +5,7 @@
  * Description: make a consensus for at least one tandem array in a FasTAN .1ano file
  * Exported functions:
  * HISTORY:
- * Last edited: Aug 10 16:08 2026 (rd109)
+ * Last edited: Aug 28 11:11 2026 (rd109)
  * Created: Thu Aug 7 02:48:43 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -74,7 +74,7 @@ int main (int argc, char *argv[])
   storeCommandLine (argc, argv) ;
   --argc ; ++argv ;
 
-  static char *usage = "Usage: tancons [-o <output_file>] [-u <unit_size>] [-s <sequence_file>] [-c <seq>:<start>-<end>] <file[.1ano]>" ;
+  static char *usage = "Usage: tancons [-o <output_file>] [-u <unit_size>] [-s <sequence_file>] [-m <min_count>] [-c <seq>:<start>-<end>] <file[.1ano]>" ;
   if (!argc) { fprintf (stderr, "%s\n", usage) ; exit(1) ; }
 
   FILE *outFile  = stdout ;
@@ -94,6 +94,11 @@ int main (int argc, char *argv[])
           if (unit <= 0) die ("bad unit size %s", *argv) ;
           --argc ; 
         }
+      else if (!strcmp (*argv, "-m") && argc > 1)
+	{ minCount = atoi(*++argv) ;
+	  if (minCount < 2) die ("min count %d must be > 1", minCount) ;
+	  --argc ;
+	}
       else if (!strcmp (*argv, "-s") && argc > 1) 
         { seqFile = *++argv ; --argc ; }
       else if (!strcmp (*argv, "-c") && argc > 1) 
