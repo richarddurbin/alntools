@@ -18,6 +18,12 @@
 #include <time.h>
 #include <pthread.h>
 
+// DP values pack the alignment score into the upper 32 bits (signed) and the number of exact matches
+// into the lower 32 bits. Penalties are multiples of ONE so they leave the match count alone, and
+// comparing packed values compares scores first and then prefers more exact matches.
+// NB the match count would carry into the score at 2^32 exact matches in one alignment.
+#define ONE ((I64)1 << 32)
+
 typedef struct MatchStruct {
   U64  start ;	   // position in current sequence
   I64  bestScore ; // best score so far at end of a query unit
@@ -35,16 +41,16 @@ typedef struct {
   int   isRC ; 
   char *name ;
   char *seq ;
-  char  startScore[32][4] ;
-  char  endScore[32][4] ;
+  I64   startScore[32][4] ;
+  I64   endScore[32][4] ;
 } Query ;
 
 typedef struct {
   int match ;
   int transition ;      /* A<->G, C<->T */
   int transversion ;    /* A<->C, A<->T, G<->C, G<->T */
-  int gapOpen ;         /* gap penalty per position */
-  int gapExtend ;       /* gap extend per position */
+  I64 gapOpen ;         /* gap penalty per position, times ONE */
+  I64 gapExtend ;       /* gap extend per position, times ONE */
 } ScoreParams ;
 
 // We are going to require an ungapped positive 32bp match to the start of the query
@@ -61,7 +67,7 @@ void queryDestroy (Array a)
   arrayDestroy (a) ;
 }
 
-static int baseScore[4][4] ;
+static I64 baseScore[4][4] ;	// score times ONE, plus 1 for an exact match
 
 static void makeStartScore (Query *q)
 {
@@ -126,7 +132,7 @@ static void matchFinish (Worker *w, ScanParams *scan, Match *match, Query *q, Sc
 {
   newFree (match->score, q->len, I64) ; match->score = 0 ;
   newFree (match->gap, q->len, I64) ; match->gap = 0 ;
-  if (match->bestScore > (I64)scan->scoreMin)
+  if ((match->bestScore >> 32) > (I64)scan->scoreMin)
     { match->next = 0 ;
       array(w->aMatch, arrayMax(w->aMatch), Match*) = match ;
       ++st->nMatch ; st->matchLen += match->bestEnd - match->start ;
@@ -145,12 +151,12 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 
   char *s = job->seq + 32 ;
   for (U64 i = 32 ; i < job->len ; ++i, ++s)
-    { int *bs = baseScore[(int)*s] ;
+    { I64 *bs = baseScore[(int)*s] ;
       for (int j = 0 ; j < nQuery ; ++j)
 	{ Query *q  = arrp(aQuery, j, Query) ;
 	  char  *qs = q->seq ;
-	  int newStart = 0 ; for (int k = 0 ; k < 32 ; ++k) newStart += q->startScore[k][(int)s[k-32]] ;
-	  int newEnd = 0 ;
+	  I64 newStart = 0 ; for (int k = 0 ; k < 32 ; ++k) newStart += q->startScore[k][(int)s[k-32]] ;
+	  I64 newEnd = 0 ;
 	  if (i < job->len - 32) for (int k = 0 ; k < 32 ; ++k) newEnd += q->endScore[k][(int)s[k]] ;
 	  Match *lastMatch = 0, *next ;
 	  for (Match *match = w->active[j] ; match ; match = next)
@@ -166,8 +172,7 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	      I64 d = ms[q->len-1] + sp.gapOpen ;
 	      for (int k = 0 ; k < q->len ; ++k, ++ms)
 		if (d > *ms) { *ms = d ; d += sp.gapExtend ; }
-		else if (*ms + sp.gapOpen > d) d = *ms + sp.gapOpen ;
-		else d += sp.gapExtend ;
+		else { I64 e = d + sp.gapExtend, o = *ms + sp.gapOpen ; d = (o > e) ? o : e ; } // extend, or open from here
 	      ms = match->score ; // extend wrap-around as far as needed
 	      for (int k = 0 ; d > *ms ; ++k)
 		{ *ms++ = d ; d += sp.gapExtend ; }
@@ -178,16 +183,15 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 		  match->isGap = false ;
 		  for (int k = 0 ; k < q->len ; ++k, ++ms, ++mg)
 		    { if (*mg > *ms) { *ms = *mg ; *mg += sp.gapExtend ; }
-		      else if (*ms + sp.gapOpen > *mg) *mg = *ms + sp.gapOpen ;
-		      else *mg += sp.gapExtend ;
-		      if (*mg > 0) match->isGap = true ;
+		      else { I64 e = *mg + sp.gapExtend, o = *ms + sp.gapOpen ; *mg = (o > e) ? o : e ; } // extend, or open from here
+		      if (*mg >= ONE) match->isGap = true ;
 		    }
 		}
 	      // finally, check if done, and if so then process match
 	      ms = match->score ;
 	      bool isDone = true ;
 	      for (int k = 0 ; k < q->len ; ++k, ++ms)
-		if (*ms > 0) isDone = false ;
+		if (*ms >= ONE) isDone = false ; // alive means score > 0, whatever the match count
 		else *ms = 0 ;
 	      if (isDone)
 		{ if (lastMatch) lastMatch->next = next ; else w->active[j] = next ;
@@ -198,16 +202,16 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 		{
 		  // update bestScore if necessary
 		  I64 mEnd = match->score[(32*(q->len-1)) % q->len] ;
-		  if ((newEnd > 0) && mEnd && (mEnd + newEnd > match->bestScore))
+		  if ((newEnd >= ONE) && mEnd && (mEnd + newEnd > match->bestScore))
 		    { match->bestScore = mEnd + newEnd ; match->bestEnd = i + 32 ; }
 		}
 
-	      if (match->score[32 % q->len] >= newStart) newStart = 0 ; // don't restart a new one
+	      if ((match->score[32 % q->len] >> 32) >= (newStart >> 32)) newStart = 0 ; // don't restart a new one: compare scores only, not match counts
 
 	      lastMatch = match ;
 	    }
 
-	  if (newStart > 0)
+	  if (newStart >= ONE)
 	    { ++st->nStart ;
 	      Match *match = new0 (1, Match) ;
 	      match->query = j ; match->target = job->target ; match->start = i-32 ;
@@ -216,11 +220,11 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	      match->gap = new0 (q->len, I64) ;
 	      int k = 32 % q->len ;
 	      ms[k] = newStart ;
-	      int d = newStart + sp.gapOpen ;
-	      if (d > 0)
+	      I64 d = newStart + sp.gapOpen ;
+	      if (d >= ONE)
 		{ match->isGap = true ;
 		  match->gap[k] = d ;
-		  while (d > 0)
+		  while (d >= ONE)
 		    { if (++k == q->len) k = 0 ;
 		      if (ms[k] >= d) break ;
 		      ms[k] = d ;
@@ -358,7 +362,7 @@ int main (int argc, char *argv[])
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
   FILE *outFile = stdout ;
-  ScoreParams sp = {1,-1,-2,-7,-1} ;
+  ScoreParams sp = {1,-1,-2,-7*ONE,-1*ONE} ;
   U64 scoreMin = 50 ;
   int nThread = 8 ;
 
@@ -387,7 +391,7 @@ int main (int argc, char *argv[])
           argc-- ;
         }
       else if (!strcmp (*argv, "-gapOpen") && argc > 1)
-        { sp.gapOpen = atoi (*++argv) ;
+        { sp.gapOpen = (I64)atoi (*++argv) * ONE ;
           if (sp.gapOpen >= 0) die ("bad gapOpen score %s\n - must be -ve%s", *argv, usage) ;
           argc-- ;
         }
@@ -403,7 +407,7 @@ int main (int argc, char *argv[])
           argc-- ;
         }
       else if (!strcmp (*argv, "-gapExtend") && argc > 1)
-        { sp.gapExtend = atoi (*++argv) ;
+        { sp.gapExtend = (I64)atoi (*++argv) * ONE ;
           if (sp.gapExtend >= 0) die ("bad gapExtend score %s\n - must be -ve%s", *argv, usage) ;
           argc-- ;
         }
@@ -413,9 +417,9 @@ int main (int argc, char *argv[])
     }
   if (argc != 2) die (usage) ;
 
-  for (int i = 4 ; i-- ;) for (int j = 4 ; j-- ;) baseScore[i][j] = sp.transversion ;
-  baseScore[0][0] = baseScore[1][1] = baseScore[2][2] = baseScore[3][3] = sp.match ;
-  baseScore[0][2] = baseScore[2][0] = baseScore[1][3] = baseScore[3][1] = sp.transition ;
+  for (int i = 4 ; i-- ;) for (int j = 4 ; j-- ;) baseScore[i][j] = (I64)sp.transversion * ONE ;
+  baseScore[0][0] = baseScore[1][1] = baseScore[2][2] = baseScore[3][3] = (I64)sp.match * ONE + 1 ;
+  baseScore[0][2] = baseScore[2][0] = baseScore[1][3] = baseScore[3][1] = (I64)sp.transition * ONE ;
  
   SeqIO *sio = seqIOopenRead (*argv, dna2index4Conv, "r") ;
   if (!sio) die ("failed to open query sequence file %s", *argv) ;
@@ -499,8 +503,9 @@ int main (int argc, char *argv[])
   arraySort (aMatch, matchOrder) ;
   for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
     { Match *m = arr(aMatch, i, Match*) ;
-      fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\n", arr(aTargetName, m->target, char*),
-	       m->start, m->bestEnd, arrp(aQuery, m->query, Query)->name, m->bestScore) ;
+      fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\n", arr(aTargetName, m->target, char*),
+	       m->start, m->bestEnd, arrp(aQuery, m->query, Query)->name,
+	       (U64)(m->bestScore >> 32), (U64)(m->bestScore & 0xffffffff)) ;
       newFree (m, 1, Match) ;
     }
 
