@@ -40,12 +40,13 @@ matches and clusters a set of candidate sequences - for example the tandem-repea
 
 ```
 > satmatch -loop -fa satfams.fa candidates.fa
-threshold 0.815
 8 sequences, total length 160
-  new mark 1: 0 (20) to 1 (20) score 0 thresh 6
-  link mark 1: 0 (20) to 2 (20) score 0 thresh 6
-  new mark 2: 3 (20) to 4 (20) score 0 thresh 6
-  new mark 3: 6 (20) to 7 (20) score 0 thresh 6
+found 0 frequency-based clusters
+threshold 0.680
+  new mark 1: 0 (20) to 1 (20) score 0 thresh 3
+  link mark 1: 0 (20) to 2 (20) score 0 thresh 3
+  new mark 2: 3 (20) to 4 (20) score 0 thresh 3
+  new mark 3: 6 (20) to 7 (20) score 0 thresh 3
 cluster 1 count 3 minLen 20 repLen 20 acgtggcattacgggcatta
   unitA	20	0
   unitA-rot	20	0
@@ -53,11 +54,15 @@ cluster 1 count 3 minLen 20 repLen 20 acgtggcattacgggcatta
 cluster 2 count 2 minLen 20 repLen 20 ggggccccaaaattttggcc
   unitB	20	0
   unitB-rot	20	0
+cluster 3 count 2 minLen 20 repLen 20 aaacccgggtttaaacccgg
+  unitD	20	0
+  unitD-rot	20	0
 ```
 
-On startup satmatch aligns many pairs of random sequences using the chosen scoring parameters to estimate a length-scaled significance threshold (reported to stderr as e.g. `threshold 0.815`); two input sequences are then linked into the same cluster if their alignment score falls at or below this factor times the length of the longer of the two (the `new/link/merge mark` lines record clusters being built up as all pairs are scanned). For each cluster found, satmatch prints a summary line with the number of members (`count`), the length of the shortest member (`minLen`), and the length and sequence of the chosen representative (`repLen`, chosen as the member with lowest total alignment score to the rest of the cluster, close to `minLen`), followed by one line per member giving its name, length, and alignment score to the representative.
+The first lines (the number of sequences, the number of composition-based preclusters, which is currently only reported, and the threshold) are written to stderr, and the cluster information to standard output.  On startup satmatch aligns many pairs of random sequences using the chosen scoring parameters to estimate a length-scaled significance threshold (reported as `threshold 0.680` above); two input sequences are then linked into the same cluster if their alignment score falls at or below this factor times the length of the longer of the two, minus 10 (the `new/link/merge mark` lines record clusters being built up as all pairs are scanned, with the threshold used).  For each cluster found, satmatch prints a summary line with the number of members (`count`), the length of the shortest member (`minLen`), and the length and sequence of the chosen representative (`repLen`, chosen as the member with lowest total alignment score to the rest of the cluster, close to `minLen`), followed by one line per member giving its name, length, and alignment score to the representative.  The representatives are written by `-fa` as fasta records named `sat-<cluster>-<length>`, as above (`>sat-1-20`, `>sat-2-20`, `>sat-3-20`), and this file can be used directly as the unit sequences for **satscan**.
 
 Options are:
+
 | Option | Meaning |
 |---|---|
 | `-ti <n>` | transition mismatch penalty (default 1) |
@@ -65,10 +70,51 @@ Options are:
 | `-gap <n>` | gap penalty per position (default 3) |
 | `-loop` | treat the second sequence of each pair as circular, so a match can start at any rotation |
 | `-fa <file>` | write the representative sequence of each cluster found to a fasta file |
-| `-sf <file>` | write one line per sequence pair (names, lengths, score, strand, and with `-loop` the best rotation offset) to a tab-separated file |
+| `-sf <file>` | write one line per sequence pair to a tab-separated file, with columns for the two names and lengths, the score, the orientation (`+` or `-`) and, with `-loop`, the best rotation offset |
 | `-random <n> <len>` | instead of reading `<seqfile>`, generate and use `n` random sequences of length `len` - useful for exploring the significance threshold |
 
-As of 14/08/2026, the last cluster found is not printed (the reporting loop stops one short), and `-sf` crashes when given a following `<seqfile>` argument due to a command-line parsing bug - let me know if you'd like these fixed.
+## satscan
+
+scans a genome sequence file for arrays of satellite repeat units, for example the representative unit sequences written by `satmatch -fa`, and reports each array that matches a unit.  Each unit is tried on both strands.  A match starts where 32bp of the target scores positively, with no gaps, against the first 32bp of the unit, and is then extended by affine-gap dynamic programming around the unit treated as a circle, so it can run through any number of copies of the repeat and tolerate substitutions and indels.  It ends at the best scoring point at which the last 32bp of the target again score positively, without gaps, against the end of the unit.  Matches are reported if their score is above `-smin`.  Example usage is (this uses a small file `mDDtail.fa` containing the last 15 sequences of the genome):
+
+```
+> satscan -o mDDtail.tsv -bed mDDtail.bed mDelDel-satmatch.fa mDDtail.fa
+read in 4 query sequences, total length 4868 bp
+NW_027193225.1:0-18000 length 18000: 4 starts, 1 matches, total match length 1749, 0.03 s
+NW_027193226.1:0-18000 length 18000: 1 starts, 1 matches, total match length 15801, 0.07 s
+...
+processed 15 target sequences, total length 232555 bp
+found 52 starts, 12 matches, total match length 103788 bp
+user	0.524434	system	0.003688	elapsed 0.539463	alloc_max 34 MB	max_RSS	638976
+> head -3 mDDtail.tsv
+NW_027193225.1:0-18000	15109	16858	sat-4-1579	472	1247	+
+NW_027193226.1:0-18000	1114	16915	sat-4-1579	14633	15369	+
+NW_027193227.1:0-17577	6488	13136	sat-4-1579	3695	5508	-
+> head -3 mDDtail.bed
+NW_027193225.1:0-18000	15109	16858	sat-4-1579	712	+
+NW_027193226.1:0-18000	1114	16915	sat-4-1579	972	+
+NW_027193227.1:0-17577	6488	13136	sat-4-1579	828	-
+```
+
+The progress lines are written to stderr, one for each target sequence as its scan finishes (so not necessarily in file order), giving the number of start windows found, the number of matches reported, their total length, and the wall time for that sequence.  The results are collected, sorted by target in file order and then by start, and written at the end.  Each line of the main output has seven tab-separated columns: the target name, the start (0-based) and end (exclusive) of the match in the target, the name of the unit sequence, the alignment score, the number of exact base matches in the alignment, and the strand, which is `-` if the reverse complement of the unit matched.  Percent identity can be calculated as 100 * (exact matches) / (end - start).  This measures exact matches against the span of the target, so bases of the unit that are skipped by a gap do not add to the denominator.  Matches from different units, or from the two strands of one unit, can overlap.
+
+With `-bed <file>` a standard [BED](https://en.wikipedia.org/wiki/BED_(file_format)) file with six columns is also written: the target, start, end, unit name, the identity in parts per thousand, `(int)(1000*matches/(end-start))`, in the score column, and the strand.  If `-bed` is given without `-o` then nothing is written to standard output; if both are given then both files are written.
+
+The default scoring is +1 for a match, -1 for a transition, -2 for a transversion, and -7 for the first position of a gap plus -1 for each further position.  Tied alignments are resolved in favour of more exact matches.  The sequences are scanned by `-T` threads (default 8), each working on one target sequence at a time, so the time is limited by the longest sequence; the results are the same for any number of threads.  Up to about two sequences per thread are held in memory at once.  As an indication of speed, a 2.7Gb genome with four unit sequences took about 3 minutes with the default 8 threads.
+
+Options are:
+
+| Option | Meaning |
+|---|---|
+| `-o <file>` | write the main output to this file (default standard output, unless `-bed` is given) |
+| `-bed <file>` | also write BED6 output to this file |
+| `-m <n>` | match score (default 1) |
+| `-ti <n>` | transition mismatch score, must be negative (default -1) |
+| `-tv <n>` | transversion mismatch score, must be negative (default -2) |
+| `-gapOpen <n>` | score for the first position of a gap, must be negative (default -7) |
+| `-gapExtend <n>` | score for each further position of a gap, must be negative (default -1) |
+| `-smin <n>` | minimum score to report a match (default 50) |
+| `-T <n>` | number of scanning threads (default 8) |
 
 ## gdbmask
 
