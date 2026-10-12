@@ -16,6 +16,7 @@
 #include "seqio.h"
 #include "ONElib.h"
 #include <string.h>
+#include <time.h>
 
 typedef struct MatchStruct {
   U64  start ;	   // position in current sequence
@@ -24,6 +25,7 @@ typedef struct MatchStruct {
   I64 *score ;     // length q->len - must be positive
   I64 *gap ;       // length q->len
   int  query ;     // index in aQuery
+  int  target ;    // index of the target sequence, in file order
   struct MatchStruct  *next ;      // index of nextMatch in aMatch
   bool isGap ;     // if we need to update gap
 } Match ;
@@ -35,7 +37,6 @@ typedef struct {
   char *seq ;
   char  startScore[32][4] ;
   char  endScore[32][4] ;
-  Match *match ;  // index of first active match in aMatch
 } Query ;
 
 typedef struct {
@@ -76,10 +77,184 @@ static void makeEndScore (Query *q)
       q->endScore[i][j] = baseScore[q->seq[(32*q->len+i-32)%q->len]][j] ;
 }
 
-static void printSeq (char *s)
-{ putchar (' ') ; putchar (' ') ;
-  for (int i = 0 ; i < 32 ; ++i) putchar ("acgt"[s[i]]) ;
-  putchar ('\n') ;
+typedef struct {		// read-only once scanning starts, so can be shared between threads
+  Array       aQuery ;
+  ScoreParams sp ;
+  U64         scoreMin ;
+} ScanParams ;
+
+typedef struct {		// everything that is private to one scanning thread
+  Match **active ;		// [nQuery] heads of the lists of active matches for each query
+  Array   aMatch ;		// Match* to report: score and gap are freed, so these are small
+} Worker ;
+
+typedef struct {
+  int   target ;		// index of this target sequence, in file order
+  char *name ;
+  char *seq ;			// not owned by the job
+  U64   len ;
+} Job ;
+
+typedef struct {
+  U64    nStart, nMatch, matchLen ;
+  double seconds ;		// wall time
+} ScanStats ;
+
+static double wallTime (void)
+{ struct timespec t ;
+  clock_gettime (CLOCK_MONOTONIC, &t) ;
+  return t.tv_sec + 1e-9*t.tv_nsec ;
+}
+
+static Worker *workerCreate (ScanParams *scan)
+{ Worker *w = new0 (1, Worker) ;
+  w->active = new0 (arrayMax(scan->aQuery), Match*) ;
+  w->aMatch = arrayCreate (256, Match*) ;
+  return w ;
+}
+
+static void workerDestroy (Worker *w, ScanParams *scan)
+{ newFree (w->active, arrayMax(scan->aQuery), Match*) ;
+  arrayDestroy (w->aMatch) ;
+  newFree (w, 1, Worker) ;
+}
+
+// match is done and unlinked: keep it for reporting if it scores well enough, else free it
+static void matchFinish (Worker *w, ScanParams *scan, Match *match, Query *q, ScanStats *st)
+{
+  newFree (match->score, q->len, I64) ; match->score = 0 ;
+  newFree (match->gap, q->len, I64) ; match->gap = 0 ;
+  if (match->bestScore > (I64)scan->scoreMin)
+    { match->next = 0 ;
+      array(w->aMatch, arrayMax(w->aMatch), Match*) = match ;
+      ++st->nMatch ; st->matchLen += match->bestEnd - match->start ;
+    }
+  else
+    newFree (match, 1, Match) ;
+}
+
+static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
+{
+  Array aQuery = scan->aQuery ;
+  const ScoreParams sp = scan->sp ;
+  int nQuery = arrayMax(aQuery) ;
+  memset (st, 0, sizeof(ScanStats)) ;
+  double t0 = wallTime () ;
+
+  char *s = job->seq + 32 ;
+  for (U64 i = 32 ; i < job->len ; ++i, ++s)
+    { int *bs = baseScore[(int)*s] ;
+      for (int j = 0 ; j < nQuery ; ++j)
+	{ Query *q  = arrp(aQuery, j, Query) ;
+	  char  *qs = q->seq ;
+	  int newStart = 0 ; for (int k = 0 ; k < 32 ; ++k) newStart += q->startScore[k][(int)s[k-32]] ;
+	  int newEnd = 0 ;
+	  if (i < job->len - 32) for (int k = 0 ; k < 32 ; ++k) newEnd += q->endScore[k][(int)s[k]] ;
+	  Match *lastMatch = 0, *next ;
+	  for (Match *match = w->active[j] ; match ; match = next)
+	    {
+	      next = match->next ; // save before match can be freed below
+	      // first rotate
+	      I64 *ms = match->score ;
+	      I64 msn = ms[q->len-1] ; memmove (ms+1, ms, (q->len-1)*sizeof(I64)) ; ms[0] = msn ;
+	      // then add diagonal match scores
+	      for (int k = 0 ; k < q->len ; ++k, ++ms) if (*ms) *ms += bs[(int)qs[k]] ;
+	      // next right gaps
+	      ms = match->score ;
+	      I64 d = ms[q->len-1] + sp.gapOpen ;
+	      for (int k = 0 ; k < q->len ; ++k, ++ms)
+		if (d > *ms) { *ms = d ; d += sp.gapExtend ; }
+		else if (*ms + sp.gapOpen > d) d = *ms + sp.gapOpen ;
+		else d += sp.gapExtend ;
+	      ms = match->score ; // extend wrap-around as far as needed
+	      for (int k = 0 ; d > *ms ; ++k)
+		{ *ms++ = d ; d += sp.gapExtend ; }
+	      // next if necessary do the down gaps
+	      if (match->isGap)
+		{ ms = match->score ;
+		  I64 *mg = match->gap ;
+		  match->isGap = false ;
+		  for (int k = 0 ; k < q->len ; ++k, ++ms, ++mg)
+		    { if (*mg > *ms) { *ms = *mg ; *mg += sp.gapExtend ; }
+		      else if (*ms + sp.gapOpen > *mg) *mg = *ms + sp.gapOpen ;
+		      else *mg += sp.gapExtend ;
+		      if (*mg > 0) match->isGap = true ;
+		    }
+		}
+	      // finally, check if done, and if so then process match
+	      ms = match->score ;
+	      bool isDone = true ;
+	      for (int k = 0 ; k < q->len ; ++k, ++ms)
+		if (*ms > 0) isDone = false ;
+		else *ms = 0 ;
+	      if (isDone)
+		{ if (lastMatch) lastMatch->next = next ; else w->active[j] = next ;
+		  matchFinish (w, scan, match, q, st) ;
+		  continue ; // match is gone: skip the code below and don't set lastMatch
+		}
+	      else
+		{
+		  // update bestScore if necessary
+		  I64 mEnd = match->score[(32*(q->len-1)) % q->len] ;
+		  if ((newEnd > 0) && mEnd && (mEnd + newEnd > match->bestScore))
+		    { match->bestScore = mEnd + newEnd ; match->bestEnd = i + 32 ; }
+		}
+
+	      if (match->score[32 % q->len] >= newStart) newStart = 0 ; // don't restart a new one
+
+	      lastMatch = match ;
+	    }
+
+	  if (newStart > 0)
+	    { ++st->nStart ;
+	      Match *match = new0 (1, Match) ;
+	      match->query = j ; match->target = job->target ; match->start = i-32 ;
+	      match->next = w->active[j] ; w->active[j] = match ; // link into list
+	      I64 *ms = match->score = new0 (q->len, I64) ;
+	      match->gap = new0 (q->len, I64) ;
+	      int k = 32 % q->len ;
+	      ms[k] = newStart ;
+	      int d = newStart + sp.gapOpen ;
+	      if (d > 0)
+		{ match->isGap = true ;
+		  match->gap[k] = d ;
+		  while (d > 0)
+		    { if (++k == q->len) k = 0 ;
+		      if (ms[k] >= d) break ;
+		      ms[k] = d ;
+		      d += sp.gapExtend ;
+		    }
+		}
+	    }
+	}
+    }
+
+  for (int j = 0 ; j < nQuery ; ++j) // flush matches still active at end of sequence
+    { Query *q = arrp(aQuery, j, Query) ;
+      Match *match = w->active[j], *next ;
+      for ( ; match ; match = next)
+	{ next = match->next ;
+	  matchFinish (w, scan, match, q, st) ;
+	}
+      w->active[j] = 0 ;
+    }
+  st->seconds = wallTime () - t0 ;
+}
+
+static void reportTarget (Job *job, ScanStats *st)
+{
+  fprintf (stderr, "%s length %llu: %llu starts, %llu matches, total match length %llu, %.2f s\n",
+	   job->name, job->len, st->nStart, st->nMatch, st->matchLen, st->seconds) ;
+}
+
+// sorts by target in file order, then start position, then query
+static int matchOrder (const void *a, const void *b)
+{
+  const Match *x = *(Match* const*)a, *y = *(Match* const*)b ;
+  if (x->target != y->target) return x->target < y->target ? -1 : 1 ;
+  if (x->start != y->start) return x->start < y->start ? -1 : 1 ;
+  if (x->query != y->query) return x->query < y->query ? -1 : 1 ;
+  return 0 ;
 }
 
 int main (int argc, char *argv[])
@@ -176,146 +351,41 @@ int main (int argc, char *argv[])
 	   arrayMax(aQuery)/2, totSat) ;
  
   sio = seqIOopenRead (*argv, dna2index4Conv, "r") ;
-  if (!sio) die ("failed to open target sequence file %s", *argv) ; 
+  if (!sio) die ("failed to open target sequence file %s", *argv) ;
+  ScanParams scan = { aQuery, sp, scoreMin } ;
+  Worker *worker = workerCreate (&scan) ;
+  Array aTargetName = arrayCreate (256, char*) ;
   U64 nSeq = 0, totSeq = 0, totStart = 0, totMatch = 0, totMatchLen = 0 ;
-  Array aMatch = 0 ;
   while (seqIOread (sio))
     { ++nSeq ; totSeq += sio->seqLen ;
       if (sio->seqLen < 32) continue ;
-      U64 nStart = 0, nMatch = 0, matchLen = 0, nActive = 0 ;
-      // first make array of starts
-      fprintf (stderr,"processing sequence %s length %llu", sqioId(sio), sio->seqLen) ;
-      aMatch = arrayReCreate(aMatch, 4096, Match) ; arrayMax(aMatch) = 1 ; // burn first value
-      char *s = sqioSeq(sio) + 32 ;
-      for (U64 i = 32 ; i < sio->seqLen ; ++i, ++s)
-	{ int *bs = baseScore[*s] ;
-	  for (int j = 0 ; j < arrayMax(aQuery) ; ++j)
-	    { Query *q  = arrp(aQuery, j, Query) ;
-	      char  *qs = q->seq ;
-	      int newStart = 0 ; for (int k = 0 ; k < 32 ; ++k) newStart += q->startScore[k][s[k-32]] ;
-	      int newEnd = 0 ;
-	      if (i < sio->seqLen - 32) for (int k = 0 ; k < 32 ; ++k) newEnd += q->endScore[k][s[k]] ;
-	      Match *lastMatch = 0, *next ;
-	      for (Match *match = q->match ; match ; match = next)
-		{
-		  next = match->next ; // save before match can be freed below
-			  // first rotate
-		  I64 *ms = match->score ;
-		  I64 msn = ms[q->len-1] ; memmove (ms+1, ms, (q->len-1)*sizeof(I64)) ; ms[0] = msn ;
-		  // then add diagonal match scores
-		  for (int k = 0 ; k < q->len ; ++k, ++ms) if (*ms) *ms += bs[qs[k]] ;
-		  // next right gaps
-		  ms = match->score ;
-		  I64 d = ms[q->len-1] + sp.gapOpen ;
-		  for (int k = 0 ; k < q->len ; ++k, ++ms)
-		    if (d > *ms) { *ms = d ; d += sp.gapExtend ; }
-		    else if (*ms + sp.gapOpen > d) d = *ms + sp.gapOpen ;
-		    else d += sp.gapExtend ;
-		  ms = match->score ; // extend wrap-around as far as needed
-		  for (int k = 0 ; d > *ms ; ++k)
-		    { *ms++ = d ; d += sp.gapExtend ; }
-		  // next if necessary do the down gaps
-		  if (match->isGap)
-		    { ms = match->score ;
-		      I64 *mg = match->gap ;
-		      match->isGap = false ;
-		      for (int k = 0 ; k < q->len ; ++k, ++ms, ++mg)
-			{ if (*mg > *ms) { *ms = *mg ; *mg += sp.gapExtend ; }
-			  else if (*ms + sp.gapOpen > *mg) *mg = *ms + sp.gapOpen ;
-			  else *mg += sp.gapExtend ;
-			  if (*mg > 0) match->isGap = true ;
-			}
-		    }
-		  // finally, check if done, and if so then process match
-		  ms = match->score ;
-		  bool isDone = true ;
-		  for (int k = 0 ; k < q->len ; ++k, ++ms)
-		    if (*ms > 0) isDone = false ;
-		    else *ms = 0 ;
-		  if (isDone)
-		    { if (match->bestScore > (I64)scoreMin)
-			{ fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\n", sqioId(sio),
-				   match->start, match->bestEnd, q->name, match->bestScore) ;
-			  ++nMatch ; matchLen += match->bestEnd - match->start ;
-			}
-		      if (lastMatch) lastMatch->next = next ; else q->match = next ;
-		      newFree (match->score, q->len, I64) ;
-		      newFree (match->gap, q->len, I64) ;
-		      newFree (match, 1, Match) ;
-		      --nActive ;
-			      continue ; // match is freed: skip the code below and don't set lastMatch
-		    }
-		  else
-		    {
-		      // printf ("  %llu i %llu newEnd %d :", match->start, i, newEnd) ;
-		      // for (int k = 0 ; k < q->len ; ++k) printf (" %lld", match->score[k]) ;
-		      // putchar ('\n') ;
-		      // update bestScore if necessary
-		      I64 mEnd = match->score[(32*(q->len-1)) % q->len] ;
-		      if ((newEnd > 0) && mEnd && (mEnd + newEnd > match->bestScore))
-			{ match->bestScore = mEnd + newEnd ; match->bestEnd = i + 32 ;
-			  // printf ("** new best i %llu (32*(q->len-1))%%q->len %d mEnd %lld newEnd %d\n",
-			  //  	  i, (32*(q->len-1))%q->len, mEnd, newEnd) ;
-			}
-		    }
-		    
-		  if (match->score[32 % q->len] >= newStart) newStart = 0 ; // don't restart a new one
-
-		  lastMatch = match ;
-		}
-	      
-	      if (newStart > 0)
-		{ ++nStart ; ++nActive ;
-		  Match *match = new0 (1, Match) ;
-		  match->query = j ; match->start = i-32 ;
-		  match->next = q->match ; q->match = match ; // link into list
-		  I64 *ms = match->score = new0 (q->len, I64) ;
-		  match->gap = new0 (q->len, I64) ;
-		  int k = 32 % q->len ;
-		  ms[k] = newStart ;
-		  // if (match->next)
-		  // printf ("RESTART newStart %lld start %llu last->score %lld last->start %llu\n",
-		  // match->score[k], match->start, match->next->score[k], match->next->start) ;
-		  int d = newStart + sp.gapOpen ;
-		  if (d > 0)
-		    { match->isGap = true ;
-		      match->gap[k] = d ;
-		      while (d > 0)
-			{ if (++k == q->len) k = 0 ;
-			  if (ms[k] >= d) break ;
-			  ms[k] = d ;
-			  d += sp.gapExtend ;
-			}
-		    }
-		}
-	    }
-
-	  if (!(i%1000000)) { fputc ('.',stderr) ; fflush (stderr) ; }
-	}
-      for (int j = 0 ; j < arrayMax(aQuery) ; ++j) // flush matches still active at end of sequence
-	{ Query *q = arrp(aQuery, j, Query) ;
-	  Match *match = q->match, *next ;
-	  for ( ; match ; match = next)
-	    { next = match->next ;
-	      if (match->bestScore > (I64)scoreMin)
-		{ fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\n", sqioId(sio),
-				   match->start, match->bestEnd, q->name, match->bestScore) ;
-		  ++nMatch ; matchLen += match->bestEnd - match->start ;
-		}
-	      newFree (match->score, q->len, I64) ;
-	      newFree (match->gap, q->len, I64) ;
-	      newFree (match, 1, Match) ;
-	    }
-	  q->match = 0 ;
-	}
-      fprintf (stderr," %llu starts, %llu matches, total match length %llu\n", nStart, nMatch, matchLen) ;
-      totStart += nStart ; totMatch += nMatch ; totMatchLen += matchLen ;
+      Job job ;
+      job.target = arrayMax(aTargetName) ;
+      job.name = strdup (sqioId(sio)) ;
+      array(aTargetName, job.target, char*) = job.name ;
+      job.seq = sqioSeq(sio) ; job.len = sio->seqLen ;
+      ScanStats st ;
+      scanTarget (&scan, worker, &job, &st) ;
+      reportTarget (&job, &st) ;
+      totStart += st.nStart ; totMatch += st.nMatch ; totMatchLen += st.matchLen ;
     }
   seqIOclose (sio) ;
+
+  arraySort (worker->aMatch, matchOrder) ;
+  for (U64 i = 0 ; i < arrayMax(worker->aMatch) ; ++i)
+    { Match *m = arr(worker->aMatch, i, Match*) ;
+      fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\n", arr(aTargetName, m->target, char*),
+	       m->start, m->bestEnd, arrp(aQuery, m->query, Query)->name, m->bestScore) ;
+      newFree (m, 1, Match) ;
+    }
+
   fprintf (stderr, "processed %llu target sequences, total length %llu bp\n", nSeq, totSeq) ;
   fprintf (stderr, "found %llu starts, %llu matches, total match length %llu bp\n",
 	   totStart, totMatch, totMatchLen) ;
   timeTotal(stderr) ;
-  
-  queryDestroy (aQuery) ;  
+
+  for (U64 i = 0 ; i < arrayMax(aTargetName) ; ++i) free (arr(aTargetName, i, char*)) ;
+  arrayDestroy (aTargetName) ;
+  workerDestroy (worker, &scan) ;
+  queryDestroy (aQuery) ;
 }
