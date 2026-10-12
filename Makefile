@@ -5,7 +5,7 @@ CFLAGS = -O3
 
 LIBS = -lpthread -lz
 
-ALL = tanbed gdbmask svfind taco ONEview tancons satmatch
+ALL = tanbed gdbmask svfind taco ONEview tancons satmatch satscan
 
 DESTDIR = ~/bin
 
@@ -58,6 +58,9 @@ svfind: svfind.c alnseq.o alncode.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 satmatch: satmatch.c seqio.o ONElib.o $(UTILS_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+satscan: satscan.c seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 ONEview: ONEview.c ONElib.o
