@@ -17,6 +17,7 @@
 #include "ONElib.h"
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 
 typedef struct MatchStruct {
   U64  start ;	   // position in current sequence
@@ -86,6 +87,7 @@ typedef struct {		// read-only once scanning starts, so can be shared between th
 typedef struct {		// everything that is private to one scanning thread
   Match **active ;		// [nQuery] heads of the lists of active matches for each query
   Array   aMatch ;		// Match* to report: score and gap are freed, so these are small
+  U64     totStart, totMatch, totMatchLen ; // summed over all the targets this worker did
 } Worker ;
 
 typedef struct {
@@ -93,6 +95,7 @@ typedef struct {
   char *name ;
   char *seq ;			// not owned by the job
   U64   len ;
+  bool  isOwned ;		// true if seq is a malloc'd copy that the worker must free
 } Job ;
 
 typedef struct {
@@ -247,6 +250,86 @@ static void reportTarget (Job *job, ScanStats *st)
 	   job->name, job->len, st->nStart, st->nMatch, st->matchLen, st->seconds) ;
 }
 
+// scan one target, report it to stderr, update the worker's totals and release the job's sequence
+static void workerRun (ScanParams *scan, Worker *w, Job *job)
+{
+  ScanStats st ;
+  scanTarget (scan, w, job, &st) ;
+  reportTarget (job, &st) ;
+  w->totStart += st.nStart ; w->totMatch += st.nMatch ; w->totMatchLen += st.matchLen ;
+  if (job->isOwned) free (job->seq) ;
+}
+
+// Bounded queue of jobs from the master to the worker threads. Any idle worker takes the next job,
+// so a long target never holds up others. Bounding it limits memory to about 2 sequences per thread.
+
+typedef struct {
+  pthread_mutex_t lock ;
+  pthread_cond_t  notEmpty, notFull ;
+  Job            *jobs ;		// ring buffer
+  int             capacity, head, count ;
+  bool            isClosed ;		// no more jobs will be pushed
+} JobQueue ;
+
+static void queueInit (JobQueue *q, int capacity)
+{
+  pthread_mutex_init (&q->lock, 0) ;
+  pthread_cond_init (&q->notEmpty, 0) ; pthread_cond_init (&q->notFull, 0) ;
+  q->jobs = new (capacity, Job) ;
+  q->capacity = capacity ; q->head = q->count = 0 ; q->isClosed = false ;
+}
+
+static void queueDestroy (JobQueue *q)
+{
+  pthread_mutex_destroy (&q->lock) ;
+  pthread_cond_destroy (&q->notEmpty) ; pthread_cond_destroy (&q->notFull) ;
+  newFree (q->jobs, q->capacity, Job) ;
+}
+
+static void queuePush (JobQueue *q, Job *job) // blocks while the queue is full
+{
+  pthread_mutex_lock (&q->lock) ;
+  while (q->count == q->capacity) pthread_cond_wait (&q->notFull, &q->lock) ;
+  q->jobs[(q->head + q->count++) % q->capacity] = *job ;
+  pthread_cond_signal (&q->notEmpty) ;
+  pthread_mutex_unlock (&q->lock) ;
+}
+
+static bool queuePop (JobQueue *q, Job *job) // blocks while empty; false when closed and empty
+{
+  pthread_mutex_lock (&q->lock) ;
+  while (!q->count && !q->isClosed) pthread_cond_wait (&q->notEmpty, &q->lock) ;
+  if (!q->count) { pthread_mutex_unlock (&q->lock) ; return false ; }
+  *job = q->jobs[q->head] ;
+  q->head = (q->head + 1) % q->capacity ; --q->count ;
+  pthread_cond_signal (&q->notFull) ;
+  pthread_mutex_unlock (&q->lock) ;
+  return true ;
+}
+
+static void queueClose (JobQueue *q)
+{
+  pthread_mutex_lock (&q->lock) ;
+  q->isClosed = true ;
+  pthread_cond_broadcast (&q->notEmpty) ;
+  pthread_mutex_unlock (&q->lock) ;
+}
+
+typedef struct {
+  ScanParams *scan ;
+  JobQueue   *queue ;
+  Worker     *worker ;
+  pthread_t   thread ;
+} ThreadArg ;
+
+static void *workerMain (void *arg)
+{
+  ThreadArg *ta = (ThreadArg*) arg ;
+  Job job ;
+  while (queuePop (ta->queue, &job)) workerRun (ta->scan, ta->worker, &job) ;
+  return 0 ;
+}
+
 // sorts by target in file order, then start position, then query
 static int matchOrder (const void *a, const void *b)
 {
@@ -271,12 +354,14 @@ int main (int argc, char *argv[])
     "    -tv <n>            transversion mismatch score [-2]\n"
     "    -gapOpen <n>       gap open score [-7]\n"
     "    -gapExtend <n>     gap extend score [-1]\n"
-    "    -smin <n>          minimum score to report [50]\n" ;
+    "    -smin <n>          minimum score to report [50]\n"
+    "    -T <n>             number of scanning threads [8]\n" ;
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
   FILE *outFile = stdout ;
   ScoreParams sp = {1,-1,-2,-7,-1} ;
   U64 scoreMin = 50 ;
+  int nThread = 8 ;
 
   /* Process command line options */
   while (argc > 1 && **argv == '-')
@@ -305,6 +390,11 @@ int main (int argc, char *argv[])
       else if (!strcmp (*argv, "-gapOpen") && argc > 1)
         { sp.gapOpen = atoi (*++argv) ;
           if (sp.gapOpen >= 0) die ("bad gapOpen score %s\n - must be -ve%s", *argv, usage) ;
+          argc-- ;
+        }
+      else if (!strcmp (*argv, "-T") && argc > 1)
+        { nThread = atoi (*++argv) ;
+          if (nThread < 1) die ("bad number of threads %s - must be at least 1\n%s", *argv, usage) ;
           argc-- ;
         }
       else if (!strcmp (*argv, "-smin") && argc > 1)
@@ -353,9 +443,23 @@ int main (int argc, char *argv[])
   sio = seqIOopenRead (*argv, dna2index4Conv, "r") ;
   if (!sio) die ("failed to open target sequence file %s", *argv) ;
   ScanParams scan = { aQuery, sp, scoreMin } ;
-  Worker *worker = workerCreate (&scan) ;
+  Worker **worker = new0 (nThread, Worker*) ;
+  for (int t = 0 ; t < nThread ; ++t) worker[t] = workerCreate (&scan) ;
   Array aTargetName = arrayCreate (256, char*) ;
-  U64 nSeq = 0, totSeq = 0, totStart = 0, totMatch = 0, totMatchLen = 0 ;
+
+  // with one thread the master scans directly, otherwise it feeds a queue serviced by nThread workers
+  JobQueue queue ;
+  ThreadArg *ta = 0 ;
+  if (nThread > 1)
+    { queueInit (&queue, nThread) ;
+      ta = new0 (nThread, ThreadArg) ;
+      for (int t = 0 ; t < nThread ; ++t)
+	{ ta[t].scan = &scan ; ta[t].queue = &queue ; ta[t].worker = worker[t] ;
+	  if (pthread_create (&ta[t].thread, 0, workerMain, &ta[t])) die ("failed to create thread %d", t) ;
+	}
+    }
+
+  U64 nSeq = 0, totSeq = 0 ;
   while (seqIOread (sio))
     { ++nSeq ; totSeq += sio->seqLen ;
       if (sio->seqLen < 32) continue ;
@@ -363,17 +467,40 @@ int main (int argc, char *argv[])
       job.target = arrayMax(aTargetName) ;
       job.name = strdup (sqioId(sio)) ;
       array(aTargetName, job.target, char*) = job.name ;
-      job.seq = sqioSeq(sio) ; job.len = sio->seqLen ;
-      ScanStats st ;
-      scanTarget (&scan, worker, &job, &st) ;
-      reportTarget (&job, &st) ;
-      totStart += st.nStart ; totMatch += st.nMatch ; totMatchLen += st.matchLen ;
+      job.len = sio->seqLen ;
+      if (nThread == 1)
+	{ job.seq = sqioSeq(sio) ; job.isOwned = false ;
+	  workerRun (&scan, worker[0], &job) ;
+	}
+      else
+	{ job.seq = malloc (job.len) ;	// copy, because the next seqIOread overwrites the buffer
+	  if (!job.seq) die ("failed to allocate %llu bytes for sequence %s", job.len, job.name) ;
+	  memcpy (job.seq, sqioSeq(sio), job.len) ; job.isOwned = true ;
+	  queuePush (&queue, &job) ;
+	}
     }
   seqIOclose (sio) ;
 
-  arraySort (worker->aMatch, matchOrder) ;
-  for (U64 i = 0 ; i < arrayMax(worker->aMatch) ; ++i)
-    { Match *m = arr(worker->aMatch, i, Match*) ;
+  if (nThread > 1)
+    { queueClose (&queue) ;
+      for (int t = 0 ; t < nThread ; ++t) pthread_join (ta[t].thread, 0) ;
+      queueDestroy (&queue) ;
+      newFree (ta, nThread, ThreadArg) ;
+    }
+
+  // gather the matches from all the workers into the first worker's array, then sort and write
+  U64 totStart = 0, totMatch = 0, totMatchLen = 0 ;
+  Array aMatch = worker[0]->aMatch ;
+  for (int t = 0 ; t < nThread ; ++t)
+    { Worker *w = worker[t] ;
+      totStart += w->totStart ; totMatch += w->totMatch ; totMatchLen += w->totMatchLen ;
+      if (t)
+	for (U64 i = 0 ; i < arrayMax(w->aMatch) ; ++i)
+	  array(aMatch, arrayMax(aMatch), Match*) = arr(w->aMatch, i, Match*) ;
+    }
+  arraySort (aMatch, matchOrder) ;
+  for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
+    { Match *m = arr(aMatch, i, Match*) ;
       fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\n", arr(aTargetName, m->target, char*),
 	       m->start, m->bestEnd, arrp(aQuery, m->query, Query)->name, m->bestScore) ;
       newFree (m, 1, Match) ;
@@ -386,6 +513,7 @@ int main (int argc, char *argv[])
 
   for (U64 i = 0 ; i < arrayMax(aTargetName) ; ++i) free (arr(aTargetName, i, char*)) ;
   arrayDestroy (aTargetName) ;
-  workerDestroy (worker, &scan) ;
+  for (int t = 0 ; t < nThread ; ++t) workerDestroy (worker[t], &scan) ;
+  newFree (worker, nThread, Worker*) ;
   queryDestroy (aQuery) ;
 }
