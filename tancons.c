@@ -18,10 +18,15 @@ static int tanLineCompareCount (const void *a, const void *b)
 
 void parseCoord (char *s, I64 *start, I64 *end)
 {
-  char *text = s ; *start = 0 ; *end = 0 ; 
-  while (*s && *s != ':') { if (*s == '\\' && s[1]) ++s ; ++s ; }
-  if (!*s) return ; // just the identifier given
-  *s++ = 0 ; // terminate the identifier
+  char *text = s, *t = s ; *start = 0 ; *end = 0 ;
+  while (*s && *s != ':')
+    { if (*s == '\\' && s[1]) ++s ; // backslash escapes the next character, e.g. a ':' in the name
+      *t++ = *s++ ;                 // copy down in place, so the identifier loses its backslashes
+    }
+  bool hasCoord = (*s == ':') ;
+  *t = 0 ; // terminate the identifier
+  if (!hasCoord) return ; // just the identifier given
+  ++s ; // skip the ':'
   if (*s == '-') die ("must have start coord after ':' in %s", text) ;
   *start = strtoll(s, &s, 10) ;
   if (*s++ != '-') die ("must have '-' after start coord in %s", text) ;
@@ -135,7 +140,7 @@ int main (int argc, char *argv[])
 	      { *tl0 = tl ;
 		break ; // we are done
 	      }
-	    else newFree (tl0->consensus, tl0->count, I64) ;
+	    else newFree (tl.consensus, tl.count, I64) ; // not the one we want
 	  }
     }
   else if (unit) // find the unit-sized repeat with most exact-length copies and place in atl[0]
@@ -167,6 +172,9 @@ int main (int argc, char *argv[])
     }
 
   if (!arrayMax(atl)) die ("can't find any repeat units with required properties") ;
+  if (seqId && !arrp(atl,0,TanLine)->count)
+    die ("failed to find a tandem repeat in %s starting at %lld in .1ano file",
+	 seqId, (long long)arrp(atl,0,TanLine)->start) ;
 
   // sort atl and build an index from seq -> first entry with that seq
   if (arrayMax(atl) > 1) arraySort (atl, tanLineCompareSeq) ;

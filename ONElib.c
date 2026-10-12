@@ -1381,9 +1381,14 @@ OneFile *oneFileOpenRead (const char *path, OneSchema *vsArg, const char *fileTy
     else
       { f = fopen (path, "r");
 	if (!f && fileType)
-	  { char *localPath = malloc (strlen(path) + strlen(fileType) + 2) ;
-	    strcpy (localPath, path) ; strcat (localPath, ".") ; strcat (localPath, fileType) ;
-	    f = fopen (localPath, "r") ;
+	  { char *lp = (char*) malloc (strlen(path) + strlen(fileType) + 3) ;
+	    sprintf (lp, "%s.1%s", path, fileType) ;   // try the binary ending <path>.1<type> first
+	    f = fopen (lp, "r") ;
+		    if (!f)   // then the ascii ending <path>.<type>
+		      { sprintf (lp, "%s.%s", path, fileType) ;
+			f = fopen (lp, "r") ;
+		      }
+		    if (f) localPath = lp ; else free (lp) ;
 	  }
 	if (!f) return 0 ;
       }
@@ -1675,7 +1680,7 @@ OneFile *oneFileOpenRead (const char *path, OneSchema *vsArg, const char *fileTy
 
       if (strcmp (path, "-") == 0) die ("ONE error: parallel input incompatible with stdin as input");
 
-      for (i = 1 ; i < nthreads ; ++i) files[i] = fopen (path, "r") ;
+      for (i = 1 ; i < nthreads ; ++i) files[i] = fopen (localPath, "r") ;
       vf->share = nthreads ;
       vf = readThreadMake (vf, vs0, files) ;
       free (files) ;
