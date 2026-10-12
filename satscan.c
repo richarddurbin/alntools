@@ -1,4 +1,3 @@
-
 /*  File: satscan.c
  *  Author: Richard Durbin (rd109@cam.ac.uk)
  *  Copyright (C) Richard Durbin, Cambridge University, 2026
@@ -6,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 12 17:00 2026 (rd109)
+ * Last edited: Oct 12 21:37 2026 (rd109)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -93,9 +92,9 @@ typedef struct {		// everything that is private to one scanning thread
 typedef struct {
   int   target ;		// index of this target sequence, in file order
   char *name ;
-  char *seq ;			// not owned by the job
+  char *seq ;			// owned by the job if and only if ownsSeq
   U64   len ;
-  bool  isOwned ;		// true if seq is a malloc'd copy that the worker must free
+  bool  ownsSeq ;		// true if seq is a copy that the worker must newFree
 } Job ;
 
 typedef struct {
@@ -257,7 +256,7 @@ static void workerRun (ScanParams *scan, Worker *w, Job *job)
   scanTarget (scan, w, job, &st) ;
   reportTarget (job, &st) ;
   w->totStart += st.nStart ; w->totMatch += st.nMatch ; w->totMatchLen += st.matchLen ;
-  if (job->isOwned) free (job->seq) ;
+  if (job->ownsSeq) newFree (job->seq, job->len, char) ;
 }
 
 // Bounded queue of jobs from the master to the worker threads. Any idle worker takes the next job,
@@ -469,13 +468,12 @@ int main (int argc, char *argv[])
       array(aTargetName, job.target, char*) = job.name ;
       job.len = sio->seqLen ;
       if (nThread == 1)
-	{ job.seq = sqioSeq(sio) ; job.isOwned = false ;
+	{ job.seq = sqioSeq(sio) ; job.ownsSeq = false ;
 	  workerRun (&scan, worker[0], &job) ;
 	}
       else
-	{ job.seq = malloc (job.len) ;	// copy, because the next seqIOread overwrites the buffer
-	  if (!job.seq) die ("failed to allocate %llu bytes for sequence %s", job.len, job.name) ;
-	  memcpy (job.seq, sqioSeq(sio), job.len) ; job.isOwned = true ;
+	{ job.seq = new (job.len,char) ;   // copy, because the next seqIOread overwrites the buffer
+	  memcpy (job.seq, sqioSeq(sio), job.len) ; job.ownsSeq = true ;
 	  queuePush (&queue, &job) ;
 	}
     }
