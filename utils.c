@@ -67,8 +67,8 @@ void *myalloc (size_t size)
 {
   void *p = (void*) malloc (size) ;
   if (!p) die ("myalloc failure requesting %d bytes - totalAllocated %lu", size, totalAllocated) ;
-  totalAllocated += size ;
-  if (totalAllocated > maxAllocated) maxAllocated = totalAllocated ;
+  unsigned long total = atomicAdd (&totalAllocated, size) ;
+  atomicMax (&maxAllocated, total) ;
   return p ;
 }
 
@@ -78,14 +78,14 @@ void *mycalloc (size_t number, size_t size)
   if (!p)
     die ("mycalloc failure requesting %ld objects of size %ld - totalAllocated %lu",
 	 number, size, totalAllocated) ;
-  totalAllocated += size*number ;
-  if (totalAllocated > maxAllocated) maxAllocated = totalAllocated ;
+  unsigned long total = atomicAdd (&totalAllocated, size*number) ;
+  atomicMax (&maxAllocated, total) ;
   return p ;
 }
 
 void  myfree   (void* x, size_t size)
 {
-  totalAllocated -= size ;
+  atomicSub (&totalAllocated, size) ;
   if (x) free (x) ; // allows to reduce size
 }
 

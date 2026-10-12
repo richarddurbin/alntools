@@ -53,6 +53,26 @@ void  myfree   (void* x, size_t size) ;
 #define newDouble(x,n,type)         myresize((x),(n),2*(n),sizeof(type)), (n) = 2*(n)
 #define	newFree(x,n,type)           myfree((x),(n)*sizeof(type))
 
+/* Statistics counters (allocation totals etc) are updated with these. By default they are plain
+   unprotected operations, so single-threaded code pays nothing. Compile with -DUTILS_THREADSAFE
+   (utils.c, array.c, dict.c) when linking into multi-threaded code to make them atomic.
+   atomicAdd and atomicSub return the new value. atomicMax raises *p to v if v is bigger, and v
+   must not have side effects. The atomic versions use gcc >= 4.7 / clang builtins with relaxed
+   ordering, which is enough for counters, and work on Linux and macOS for any -std. */
+#ifdef UTILS_THREADSAFE
+#define atomicAdd(p,n) __atomic_add_fetch ((p), (n), __ATOMIC_RELAXED)
+#define atomicSub(p,n) __atomic_sub_fetch ((p), (n), __ATOMIC_RELAXED)
+#define atomicMax(p,v) \
+  do { __typeof__(*(p)) _old = __atomic_load_n ((p), __ATOMIC_RELAXED) ; \
+       while ((v) > _old && \
+	      !__atomic_compare_exchange_n ((p), &_old, (v), 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) ; \
+     } while (0)
+#else
+#define atomicAdd(p,n) (*(p) += (n))
+#define atomicSub(p,n) (*(p) -= (n))
+#define atomicMax(p,v) do { if ((v) > *(p)) *(p) = (v) ; } while (0)
+#endif
+
 void  storeCommandLine (int argc, char *argv[]) ;
 char *getCommandLine (void) ;
 void destroyCommandLine (void) ;

@@ -1,7 +1,7 @@
 # makefile for alntools
 
-CFLAGS = -O3
-#CFLAGS = -g	# for debugging
+CFLAGS = -O3 -DUTILS_THREADSAFE
+#CFLAGS = -g -DUTILS_THREADSAFE	# for debugging
 
 LIBS = -lpthread -lz
 
