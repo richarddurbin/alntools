@@ -351,7 +351,8 @@ int main (int argc, char *argv[])
 
   static char *usage = "Usage: satscan <options>* <sat_seqfile> <genome_seqfile>\n"
     "  options are:\n"
-    "    -o <file_name>     output file [standard output]\n"
+    "    -o <file_name>     output file [standard output, unless -bed is given]\n"
+    "    -bed <file_name>   write BED6 to this file: target, start, end, query, per-mil identity, strand\n"
     "    -m <n>             match score [1]\n"
     "    -ti <n>            transition mismatch score [-1]\n"
     "    -tv <n>            transversion mismatch score [-2]\n"
@@ -361,7 +362,7 @@ int main (int argc, char *argv[])
     "    -T <n>             number of scanning threads [8]\n" ;
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
-  FILE *outFile = stdout ;
+  FILE *outFile = 0, *bedFile = 0 ;	// outFile defaults to stdout unless -bed is given
   ScoreParams sp = {1,-1,-2,-7*ONE,-1*ONE} ;
   U64 scoreMin = 50 ;
   int nThread = 8 ;
@@ -371,6 +372,13 @@ int main (int argc, char *argv[])
     { if (!strcmp (*argv, "-o"))
         { if (!(outFile = fopen (*++argv, "w")))
             { fprintf (stderr, "failed to open output file %s\n", *argv) ;
+              exit (1) ;
+            }
+          argc-- ;
+        }
+      else if (!strcmp (*argv, "-bed") && argc > 1)
+        { if (!(bedFile = fopen (*++argv, "w")))
+            { fprintf (stderr, "failed to open bed file %s\n", *argv) ;
               exit (1) ;
             }
           argc-- ;
@@ -416,6 +424,7 @@ int main (int argc, char *argv[])
       argc-- ; argv++ ;
     }
   if (argc != 2) die (usage) ;
+  if (!outFile && !bedFile) outFile = stdout ;
 
   for (int i = 4 ; i-- ;) for (int j = 4 ; j-- ;) baseScore[i][j] = (I64)sp.transversion * ONE ;
   baseScore[0][0] = baseScore[1][1] = baseScore[2][2] = baseScore[3][3] = (I64)sp.match * ONE + 1 ;
@@ -503,9 +512,15 @@ int main (int argc, char *argv[])
   arraySort (aMatch, matchOrder) ;
   for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
     { Match *m = arr(aMatch, i, Match*) ;
-      fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\n", arr(aTargetName, m->target, char*),
-	       m->start, m->bestEnd, arrp(aQuery, m->query, Query)->name,
-	       (U64)(m->bestScore >> 32), (U64)(m->bestScore & 0xffffffff)) ;
+      char *tName = arr(aTargetName, m->target, char*) ;
+      char *qName = arrp(aQuery, m->query, Query)->name ;
+      U64   count = m->bestScore & 0xffffffff ;
+      if (outFile)
+	fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\n", tName, m->start, m->bestEnd, qName,
+		 (U64)(m->bestScore >> 32), count) ;
+      if (bedFile)	// forward queries have even index in aQuery, their reverse complements odd
+	fprintf (bedFile, "%s\t%llu\t%llu\t%s\t%d\t%c\n", tName, m->start, m->bestEnd, qName,
+		 (int)(1000 * count / (m->bestEnd - m->start)), (m->query & 1) ? '-' : '+') ;
       newFree (m, 1, Match) ;
     }
 
@@ -514,6 +529,8 @@ int main (int argc, char *argv[])
 	   totStart, totMatch, totMatchLen) ;
   timeTotal(stderr) ;
 
+  if (outFile && outFile != stdout) fclose (outFile) ;
+  if (bedFile) fclose (bedFile) ;
   for (U64 i = 0 ; i < arrayMax(aTargetName) ; ++i) free (arr(aTargetName, i, char*)) ;
   arrayDestroy (aTargetName) ;
   for (int t = 0 ; t < nThread ; ++t) workerDestroy (worker[t], &scan) ;
