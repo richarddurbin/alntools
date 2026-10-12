@@ -515,12 +515,13 @@ int main (int argc, char *argv[])
       char *tName = arr(aTargetName, m->target, char*) ;
       char *qName = arrp(aQuery, m->query, Query)->name ;
       U64   count = m->bestScore & 0xffffffff ;
+      char  strand = (m->query & 1) ? '-' : '+' ; // forward queries have even index in aQuery, their reverse complements odd
       if (outFile)
-	fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\n", tName, m->start, m->bestEnd, qName,
-		 (U64)(m->bestScore >> 32), count) ;
-      if (bedFile)	// forward queries have even index in aQuery, their reverse complements odd
+	fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\t%c\n", tName, m->start, m->bestEnd, qName,
+		 (U64)(m->bestScore >> 32), count, strand) ;
+      if (bedFile)
 	fprintf (bedFile, "%s\t%llu\t%llu\t%s\t%d\t%c\n", tName, m->start, m->bestEnd, qName,
-		 (int)(1000 * count / (m->bestEnd - m->start)), (m->query & 1) ? '-' : '+') ;
+		 (int)(1000 * count / (m->bestEnd - m->start)), strand) ;
       newFree (m, 1, Match) ;
     }
 
