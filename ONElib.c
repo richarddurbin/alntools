@@ -7,7 +7,7 @@
  *  Copyright (C) Richard Durbin, Cambridge University and Eugene Myers 2019-
  *
  * HISTORY:
- * Last edited: Aug 14 13:33 2026 (rd109)
+ * Last edited: Oct 13 00:54 2026 (rd109)
  * * May 14 16:34 2026 (rd109): made list (including DNA) read/write work with len > 2G
  * * Oct  2 09:30 2025 (rd109): add localPath in OpenRead to try <path>.1<type> if <path> fails
  * * May  1 00:23 2024 (rd109): moved to OneInfo->index and multiple objects/groups
