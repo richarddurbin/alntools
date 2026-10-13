@@ -94,32 +94,33 @@ Options are:
 
 ## satscan
 
-scans a genome sequence file for arrays of satellite repeat units, for example the representative unit sequences written by `satmatch -fa`, and reports each array that matches a unit.  Each unit is tried on both strands.  A match starts where 32bp of the target scores positively, with no gaps, against the first 32bp of the unit, and is then extended by affine-gap dynamic programming around the unit treated as a circle, so it can run through any number of copies of the repeat and tolerate substitutions and indels.  It ends at the best scoring point at which the last 32bp of the target again score positively, without gaps, against the end of the unit.  Matches are reported if their score is above `-smin`.  Example usage is (this uses a small file `mDDtail.fa` containing the last 15 sequences of the genome):
+scans a genome sequence file for arrays of satellite repeat units, for example the representative unit sequences written by `satmatch -fa`, and reports each array that matches a unit.  Each unit is tried on both strands.  A match starts where 32bp of the target scores positively, with no gaps, against the first 32bp of the unit, and is then extended by affine-gap dynamic programming around the unit treated as a circle, so it can run through any number of copies of the repeat and tolerate substitutions and indels.  It ends at the best scoring point at which the last 32bp of the target again score positively, without gaps, against the end of the unit.  Matches are reported if their score is above `-smin`.  Example usage is, for the human genome and the 171bp centromeric alpha satellite unit:
 
 ```
-> satscan -o mDDtail.tsv -bed mDDtail.bed mDelDel-satmatch.fa mDDtail.fa
-read in 4 query sequences, total length 4868 bp
-NW_027193225.1:0-18000 length 18000: 4 starts, 1 matches, total match length 1749, 0.03 s
-NW_027193226.1:0-18000 length 18000: 1 starts, 1 matches, total match length 15801, 0.07 s
+> satscan -o mHomSap-cen.tsv -bed mHomSap-cen.bed mHomSap-cen.fa mHomSap.fa.gz
+read in 1 query sequences, total length 171 bp
+chr3 length 201105948: 4974 starts, 5 matches, total match length 3159469, 8.23 s
+chr2 length 242696752: 6187 starts, 6 matches, total match length 2509879, 8.89 s
+chr6 length 172126628: 4339 starts, 6 matches, total match length 3213332, 8.04 s
 ...
-processed 15 target sequences, total length 232555 bp
-found 52 starts, 12 matches, total match length 103788 bp
-user	0.524434	system	0.003688	elapsed 0.539463	alloc_max 34 MB	max_RSS	638976
-> head -3 mDDtail.tsv
-NW_027193225.1:0-18000	15109	16858	sat-4-1579	472	1247	+
-NW_027193226.1:0-18000	1114	16915	sat-4-1579	14633	15369	+
-NW_027193227.1:0-17577	6488	13136	sat-4-1579	3695	5508	-
-> head -3 mDDtail.bed
-NW_027193225.1:0-18000	15109	16858	sat-4-1579	712	+
-NW_027193226.1:0-18000	1114	16915	sat-4-1579	972	+
-NW_027193227.1:0-17577	6488	13136	sat-4-1579	828	-
+processed 25 target sequences, total length 3117292070 bp
+found 72105 starts, 376 matches, total match length 83079609 bp
+user	176.639831	system	0.598949	elapsed 26.322544	alloc_max 3203 MB	max_RSS	3439017984
+> head -3 mHomSap-cen.tsv
+chr1	103897763	103898275	cen-171	78	352	+
+chr1	103908986	103911559	cen-171	472	1839	+
+chr1	121619161	121795996	cen-171	78459	143024	-
+> head -3 mHomSap-cen.bed
+chr1	103897763	103898275	cen-171	687	+
+chr1	103908986	103911559	cen-171	714	+
+chr1	121619161	121795996	cen-171	808	-
 ```
 
 The progress lines are written to stderr, one for each target sequence as its scan finishes (so not necessarily in file order), giving the number of start windows found, the number of matches reported, their total length, and the wall time for that sequence.  The results are collected, sorted by target in file order and then by start, and written at the end.  Each line of the main output has seven tab-separated columns: the target name, the start (0-based) and end (exclusive) of the match in the target, the name of the unit sequence, the alignment score, the number of exact base matches in the alignment, and the strand, which is `-` if the reverse complement of the unit matched.  Percent identity can be calculated as 100 * (exact matches) / (end - start).  This measures exact matches against the span of the target, so bases of the unit that are skipped by a gap do not add to the denominator.  Matches from different units, or from the two strands of one unit, can overlap.
 
 With `-bed <file>` a standard [BED](https://en.wikipedia.org/wiki/BED_(file_format)) file with six columns is also written: the target, start, end, unit name, the identity in parts per thousand, `(int)(1000*matches/(end-start))`, in the score column, and the strand.  If `-bed` is given without `-o` then nothing is written to standard output; if both are given then both files are written.
 
-The default scoring is +1 for a match, -1 for a transition, -2 for a transversion, and -7 for the first position of a gap plus -1 for each further position.  Tied alignments are resolved in favour of more exact matches.  The sequences are scanned by `-T` threads (default 8), each working on one target sequence at a time, so the time is limited by the longest sequence; the results are the same for any number of threads.  Up to about two sequences per thread are held in memory at once.  As an indication of speed, a 2.7Gb genome with four unit sequences took about 3 minutes with the default 8 threads.
+The default scoring is +1 for a match, -1 for a transition, -2 for a transversion, and -7 for the first position of a gap plus -1 for each further position.  Tied alignments are resolved in favour of more exact matches.  The sequences are scanned by `-T` threads (default 8), each working on one target sequence at a time, so the time is limited by the longest sequence; the results are the same for any number of threads.  Up to about two sequences per thread are held in memory at once.  As an indication of speed, scanning the 3.1Gb human genome for the single 171bp unit above took about 26 seconds with the default 8 threads, and for 12 units of 20 to 171bp about 2.5 minutes.
 
 Options are:
 
