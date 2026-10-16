@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# sequence and onefiles
+*.fa
+*.fa.gz
+*.bed
+*.1*
+*.bps
+*.gix
+*.ktab.*
