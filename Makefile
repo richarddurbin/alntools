@@ -32,6 +32,8 @@ tancons.o: alntools.h ONElib.h $(UTILS_HEADERS)
 
 gdb.o: alntools.h ONElib.h $(UTILS_HEADERS)
 
+satscan.o: onerep.h seqio.h ONElib.h $(UTILS_HEADERS)
+
 SEQIO_OPTS = -DONEIO
 seqio.o: seqio.c seqio.h ONElib.h $(UTILS_HEADERS)
 	$(CC) $(CFLAGS) $(SEQIO_OPTS) -c $^
@@ -60,8 +62,8 @@ svfind: svfind.c alnseq.o alncode.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 satmatch: satmatch.c seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-satscan: satscan.c onerep.h seqio.o ONElib.o $(UTILS_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(filter-out %.h,$^) $(LIBS)
+satscan: satscan.o seqio.o ONElib.o $(UTILS_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 ONEview: ONEview.c ONElib.o
 	$(CC) $(CFLAGS) -o $@ $^
