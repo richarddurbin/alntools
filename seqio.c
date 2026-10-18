@@ -5,7 +5,7 @@
  * Description: buffered package to read arbitrary sequence files - much faster than readseq
  * Exported functions:
  * HISTORY:
- * Last edited: Aug 25 19:06 2026 (rd109)
+ * Last edited: Oct 19 09:40 2026 (claude)
  * * Aug 25 19:05 2026 (rd109): Claude added gzreadU64()
  * * Dec 15 09:45 2022 (rd109): separated out 2bit packing/unpacking into SeqPack
  * Created: Fri Nov  9 00:21:21 2018 (rd109)
@@ -106,8 +106,9 @@ SeqIO *seqIOopenRead (char *filename, int* convert, bool isQual)
   else if (*si->buf == '1')
     { gzclose (si->gzf) ; si->gzf = 0 ;
       OneFile *vf = oneFileOpenRead (filename, 0, "seq", 1) ;
-      if (!vf)
+      if (!vf || !oneFileCheckSchemaText (vf, "P 3 seq\nO S 1 3 DNA\n"))
 	{ fprintf (stderr, "failed to open ONE seq file %s\n", filename) ;
+	  if (vf) oneFileClose (vf) ;
 	  seqIOclose (si) ;
 	  return 0 ;
 	}
