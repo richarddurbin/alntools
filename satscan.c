@@ -5,13 +5,13 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 12 21:37 2026 (rd109)
+ * Last edited: Oct 19 00:19 2026 (rd109)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
 
-#include "utils.h"
-#include "array.h"
+#include "onerep.h"
+#include "array.h"  // contains utils.h
 #include "seqio.h"
 #include "ONElib.h"
 #include <string.h>
@@ -38,8 +38,9 @@ typedef struct MatchStruct {
 
 typedef struct {
   int   len ;
-  int   isRC ; 
-  char *name ;
+  int   isRC ;
+  int   index ;     // 1-based position of the entry in the query file, counting any that were skipped
+  char *name ;      // shared between a forward query and its reverse complement
   char *seq ;
   I64   startScore[32][4] ;
   I64   endScore[32][4] ;
@@ -333,12 +334,16 @@ static void *workerMain (void *arg)
   return 0 ;
 }
 
-// sorts by target in file order, then start position, then query
+static int nQueryFwd ; // number of forward queries, for matchOrder()
+
+// sorts by target in file order, then start position, then query with each forward query before its reverse complement
 static int matchOrder (const void *a, const void *b)
 {
   const Match *x = *(Match* const*)a, *y = *(Match* const*)b ;
   if (x->target != y->target) return x->target < y->target ? -1 : 1 ;
   if (x->start != y->start) return x->start < y->start ? -1 : 1 ;
+  int xq = x->query % nQueryFwd, yq = y->query % nQueryFwd ;
+  if (xq != yq) return xq < yq ? -1 : 1 ;
   if (x->query != y->query) return x->query < y->query ? -1 : 1 ;
   return 0 ;
 }
@@ -430,28 +435,66 @@ int main (int argc, char *argv[])
   baseScore[0][0] = baseScore[1][1] = baseScore[2][2] = baseScore[3][3] = (I64)sp.match * ONE + 1 ;
   baseScore[0][2] = baseScore[2][0] = baseScore[1][3] = baseScore[3][1] = (I64)sp.transition * ONE ;
  
-  SeqIO *sio = seqIOopenRead (*argv, dna2index4Conv, "r") ;
-  if (!sio) die ("failed to open query sequence file %s", *argv) ;
   Array aQuery = arrayCreate (256, Query) ;
+  int nEntry = 0, nSkip = 0 ;
+  OneSchema *schema = oneSchemaCreateFromText(repeatSchemaText) ;
+  OneFile *of = oneFileOpenRead (*argv, schema, "lib", 1) ;
+  if (of)
+    { oneGoto (of, 'S', 1) ; oneReadLine (of) ; // start at first sequence
+      while (of->lineType == 'S')
+	{ Query *q = arrayp (aQuery, arrayMax(aQuery), Query) ;
+	  bool isTandem = true ;
+	  q->index = ++nEntry ;
+	  q->len = oneLen(of) ;
+	  q->seq = new (q->len, char) ;
+	  char *s = oneDNAchar(of) ;
+	  for (int i = 0 ; i < q->len ; ++i) q->seq[i] = dna2index4Conv[(int)s[i]] ;
+	  while (oneReadLine (of) && of->lineType != 'S')
+	    if (of->lineType == 'I' && !q->name)
+	      { q->name = new (oneLen(of)+1, char) ; strcpy (q->name, oneString(of)) ; }
+	    else if (of->lineType == 'Y' && strncmp (oneString(of), "tandem", 6))
+	      isTandem = false ;
+	  if (isTandem)
+	    { if (!q->name)
+		{ q->name = new (16, char) ; sprintf (q->name, "tandem-%d", nEntry) ; }
+	    }
+	  else
+	    { ++nSkip ; newFree (q->seq, q->len, char) ;
+	      if (q->name) { newFree (q->name, strlen(q->name)+1, char) ; q->name = 0 ; }
+	      --arrayMax(aQuery) ; // fail to register this entry
+	    }
+	}
+      oneFileClose (of) ;
+    }
+  else
+    { SeqIO *sio = seqIOopenRead (*argv, dna2index4Conv, "r") ;
+      if (!sio) die ("failed to open query sequence file %s", *argv) ;
+      while (seqIOread (sio))
+	{ Query *q = arrayp (aQuery, arrayMax(aQuery), Query) ;
+	  q->len = sio->seqLen ; q->index = ++nEntry ;
+	  q->name = new (strlen(sqioId(sio))+1, char) ; strcpy (q->name, sqioId(sio)) ;
+	  q->seq = new (q->len, char) ; memcpy (q->seq, sqioSeq(sio), q->len) ;
+	}
+      seqIOclose (sio) ;
+    }
+  int nQuery = nQueryFwd = arrayMax(aQuery) ;
+  if (!nQuery) die ("no tandem query sequences in %s", *argv) ;
   U64 totSat = 0 ;
-  while (seqIOread (sio))
-    { Query *q = arrayp (aQuery, arrayMax(aQuery), Query) ;
-      q->len = sio->seqLen ; 
-      q->name = strdup (sqioId(sio)) ;
-      q->seq = new (q->len, char) ; memcpy (q->seq, sqioSeq(sio), q->len) ;
-      makeStartScore (q) ; makeEndScore (q) ;
-      Query *qr = arrayp (aQuery, arrayMax(aQuery), Query) ;
-      q = arrp(aQuery, arrayMax(aQuery)-2, Query) ; // arrayp() may have reallocated
-      qr->len = q->len ; qr->name = q->name ; qr->isRC = true ;
+  for (int i = 0 ; i < nQuery ; ++i) // reverse complements go after the forward queries
+    { Query *qr = arrayp (aQuery, nQuery+i, Query) ;
+      Query *q = arrp (aQuery, i, Query) ; // after arrayp(), which may have reallocated
+      *qr = *q ; qr->isRC = true ;
       qr->seq = seqRevComp (q->seq, q->len) ;
+      makeStartScore (q) ; makeEndScore (q) ;
       makeStartScore (qr) ; makeEndScore (qr) ;
       totSat += q->len ;
     }
-  seqIOclose (sio) ;
   --argc ; ++argv ;
-  fprintf (stderr, "read in %llu query sequences, total length %llu bp\n",
-	   arrayMax(aQuery)/2, totSat) ;
- 
+  fprintf (stderr, "read in %d query sequences, total length %llu bp", nQuery, totSat) ;
+  if (nSkip) fprintf (stderr, ", skipping %d whose type is not tandem", nSkip) ;
+  fprintf (stderr, "\n") ;
+
+  SeqIO *sio ;
   sio = seqIOopenRead (*argv, dna2index4Conv, "r") ;
   if (!sio) die ("failed to open target sequence file %s", *argv) ;
   ScanParams scan = { aQuery, sp, scoreMin } ;
@@ -513,9 +556,10 @@ int main (int argc, char *argv[])
   for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
     { Match *m = arr(aMatch, i, Match*) ;
       char *tName = arr(aTargetName, m->target, char*) ;
-      char *qName = arrp(aQuery, m->query, Query)->name ;
-      U64   count = m->bestScore & 0xffffffff ;
-      char  strand = (m->query & 1) ? '-' : '+' ; // forward queries have even index in aQuery, their reverse complements odd
+      Query *q    = arrp(aQuery, m->query, Query) ;
+      char  *qName = q->name ;
+      U64    count = m->bestScore & 0xffffffff ;
+      char   strand = q->isRC ? '-' : '+' ;
       if (outFile)
 	fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\t%c\n", tName, m->start, m->bestEnd, qName,
 		 (U64)(m->bestScore >> 32), count, strand) ;
@@ -537,4 +581,5 @@ int main (int argc, char *argv[])
   for (int t = 0 ; t < nThread ; ++t) workerDestroy (worker[t], &scan) ;
   newFree (worker, nThread, Worker*) ;
   queryDestroy (aQuery) ;
+  oneSchemaDestroy (schema) ;
 }
