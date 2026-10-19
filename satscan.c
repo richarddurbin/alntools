@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 19 12:55 2026 (claude)
+ * Last edited: Oct 19 00:19 2026 (rd109)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -24,12 +24,27 @@
 // NB the match count would carry into the score at 2^32 exact matches in one alignment.
 #define ONE ((I64)1 << 32)
 
+// The copy parse (approach A'): every DP cell carries the index of the CopyNode for the start of
+// the copy of the unit that its path is in. A new node is made each time a path wraps round from the
+// end of the unit to the start, so following prev from the best end recovers the copy boundaries.
+typedef struct {
+  U32  pos ;	   // start of a copy, relative to match->start
+  U32  prev ;	   // node of the previous copy start; node 0 is the match start
+} CopyNode ;
+
 typedef struct MatchStruct {
   U64  start ;	   // position in current sequence
   I64  bestScore ; // best score so far at end of a query unit
   U64  bestEnd ;   // end position of bestScore
   I64 *score ;     // length q->len - must be positive
   I64 *gap ;       // length q->len
+  U32 *copy ;      // length q->len: CopyNode index for each score cell
+  U32 *gapCopy ;   // length q->len: CopyNode index for each gap cell
+  Array aNode ;    // of CopyNode
+  U32  nodeLimit ; // compact aNode when it grows past this
+  U32  bestNode ;  // CopyNode of the copy that bestScore ends in
+  U32 *parse ;     // internal copy boundaries relative to start, made by matchFinish() if reported
+  int  nParse ;
   int  query ;     // index in aQuery
   int  target ;    // index of the target sequence, in file order
   struct MatchStruct  *next ;      // index of nextMatch in aMatch
@@ -134,12 +149,69 @@ static void workerDestroy (Worker *w, ScanParams *scan)
   newFree (w, 1, Worker) ;
 }
 
+static inline U32 copyNodeAdd (Match *match, U64 pos, U32 prev) // pos is in target coordinates
+{
+  U32 n = arrayMax(match->aNode) ;
+  CopyNode *c = arrayp(match->aNode, n, CopyNode) ;
+  c->pos = pos - match->start ; c->prev = prev ;
+  return n ;
+}
+
+// Keep only the nodes reachable from live cells and bestNode, renumbering them in order. A node's prev
+// is always made before it, so renumbering in order keeps prev < node, and node 0 stays the start.
+static void copyNodeCompact (Match *match, int len)
+{
+  U32  n = arrayMax(match->aNode) ;
+  CopyNode *node = arrp(match->aNode, 0, CopyNode) ;
+  U32 *map = new0 (n, U32) ; // first marks the reachable nodes with 1, then holds the new index
+  map[0] = 1 ;
+  for (int k = 0 ; k < len ; ++k)
+    { if (match->score[k] < ONE) match->copy[k] = 0 ;
+      if (match->gap[k] < ONE) match->gapCopy[k] = 0 ;
+      for (U32 c = match->copy[k] ; !map[c] ; c = node[c].prev) map[c] = 1 ;
+      for (U32 c = match->gapCopy[k] ; !map[c] ; c = node[c].prev) map[c] = 1 ;
+    }
+  for (U32 c = match->bestNode ; !map[c] ; c = node[c].prev) map[c] = 1 ;
+  U32 nNew = 0 ;
+  for (U32 c = 0 ; c < n ; ++c)
+    if (map[c])
+      { node[nNew].pos = node[c].pos ; node[nNew].prev = map[node[c].prev] ; // prev < c so already mapped
+	map[c] = nNew++ ;
+      }
+  arrayMax(match->aNode) = nNew ;
+  for (int k = 0 ; k < len ; ++k)
+    { match->copy[k] = map[match->copy[k]] ; match->gapCopy[k] = map[match->gapCopy[k]] ; }
+  match->bestNode = map[match->bestNode] ;
+  newFree (map, n, U32) ;
+  match->nodeLimit = 2*nNew + 4*len ;
+}
+
+// fill match->parse with the internal copy boundaries of the best alignment, in increasing order
+static void matchParse (Match *match, Query *q)
+{
+  CopyNode *node = arrp(match->aNode, 0, CopyNode) ;
+  int n = 0 ;
+  for (U32 c = match->bestNode ; c ; c = node[c].prev) ++n ;
+  U64 endStart = match->bestEnd - 32 - match->start ; // the final 32bp, aligned ungapped to the end of the unit
+  for (int k = 1 ; k < 32 ; ++k) if ((32 - k) % q->len == 0) ++n ; // copies starting inside that
+  match->nParse = n ;
+  match->parse = new (n ? n : 1, U32) ;
+  int i = n ;
+  for (int k = 31 ; k > 0 ; --k) if ((32 - k) % q->len == 0) match->parse[--i] = endStart + k ;
+  for (U32 c = match->bestNode ; c ; c = node[c].prev) match->parse[--i] = node[c].pos ;
+}
+
 // match is done and unlinked: keep it for reporting if it scores well enough, else free it
 static void matchFinish (Worker *w, ScanParams *scan, Match *match, Query *q, ScanStats *st)
 {
   newFree (match->score, q->len, I64) ; match->score = 0 ;
   newFree (match->gap, q->len, I64) ; match->gap = 0 ;
-  if ((match->bestScore >> 32) > (I64)scan->scoreMin)
+  newFree (match->copy, q->len, U32) ; match->copy = 0 ;
+  newFree (match->gapCopy, q->len, U32) ; match->gapCopy = 0 ;
+  bool isReport = (match->bestScore >> 32) > (I64)scan->scoreMin ;
+  if (isReport) matchParse (match, q) ;
+  arrayDestroy (match->aNode) ; match->aNode = 0 ;
+  if (isReport)
     { match->next = 0 ;
       array(w->aMatch, arrayMax(w->aMatch), Match*) = match ;
       ++st->nMatch ; st->matchLen += match->bestEnd - match->start ;
@@ -169,34 +241,58 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	  for (Match *match = w->active[j] ; match ; match = next)
 	    {
 	      next = match->next ; // save before match can be freed below
-	      // first rotate
+	      // first rotate: the cell moving from the end of the unit to the start begins a new copy at i
 	      I64 *ms = match->score ;
 	      I64 msn = ms[q->len-1] ; memmove (ms+1, ms, (q->len-1)*sizeof(I64)) ; ms[0] = msn ;
+	      U32 *mc = match->copy ;
+	      U32 mcn = mc[q->len-1] ; memmove (mc+1, mc, (q->len-1)*sizeof(U32)) ;
+	      mc[0] = msn ? copyNodeAdd (match, i, mcn) : 0 ;
 	      // then add diagonal match scores
 	      for (int k = 0 ; k < q->len ; ++k, ++ms) if (*ms) *ms += bs[(int)qs[k]] ;
-	      // next right gaps
-	      ms = match->score ;
+	      // next right gaps. These delete query bases, so when a gap wraps from the end of the unit
+	      // to the start, the next copy starts at i+1. Only make its CopyNode if the gap is used.
+	      ms = match->score ; mc = match->copy ;
 	      I64 d = ms[q->len-1] + sp.gapOpen ;
+	      U32 dc = mc[q->len-1] ;
+	      bool isWrap = true ; // d has wrapped since dc was set
 	      I64 *gi = w->gapIn ;
-	      for (int k = 0 ; k < q->len ; ++k, ++ms)
-		if ((*gi++ = d) > *ms) { *ms = d ; d += sp.gapExtend ; }
-		else { I64 e = d + sp.gapExtend, o = *ms + sp.gapOpen ; d = (o > e) ? o : e ; } // extend, or open from here
+	      for (int k = 0 ; k < q->len ; ++k, ++ms, ++mc)
+		if ((*gi++ = d) > *ms)
+		  { if (isWrap) { dc = copyNodeAdd (match, i+1, dc) ; isWrap = false ; }
+		    *ms = d ; *mc = dc ; d += sp.gapExtend ;
+		  }
+		else // extend, or open from here
+		  { I64 e = d + sp.gapExtend, o = *ms + sp.gapOpen ;
+		    if (o > e) { d = o ; dc = *mc ; isWrap = false ; } else d = e ;
+		  }
 	      // Extend the wrap-around while it beats the gap that arrived at each cell on the first pass:
 	      // it can pass cells it doesn't improve, but once below that value it can't win further on.
-	      ms = match->score ; gi = w->gapIn ;
+	      ms = match->score ; mc = match->copy ; gi = w->gapIn ;
+	      bool isWrap2 = true ; // d has wrapped again
 	      for (int k = 0 ; k < q->len && d > gi[k] ; ++k, d += sp.gapExtend)
-		if (d > ms[k]) ms[k] = d ;
+		if (d > ms[k])
+		  { if (isWrap2)
+		      { if (isWrap) dc = copyNodeAdd (match, i+1, dc) ; // gap went right round the unit unused
+			dc = copyNodeAdd (match, i+1, dc) ; isWrap2 = false ;
+		      }
+		    ms[k] = d ; mc[k] = dc ;
+		  }
 	      // next if necessary do the down gaps
 	      if (match->isGap)
-		{ ms = match->score ;
+		{ ms = match->score ; mc = match->copy ;
 		  I64 *mg = match->gap ;
+		  U32 *mgc = match->gapCopy ;
 		  match->isGap = false ;
-		  for (int k = 0 ; k < q->len ; ++k, ++ms, ++mg)
-		    { if (*mg > *ms) { *ms = *mg ; *mg += sp.gapExtend ; }
-		      else { I64 e = *mg + sp.gapExtend, o = *ms + sp.gapOpen ; *mg = (o > e) ? o : e ; } // extend, or open from here
+		  for (int k = 0 ; k < q->len ; ++k, ++ms, ++mg, ++mc, ++mgc)
+		    { if (*mg > *ms) { *ms = *mg ; *mc = *mgc ; *mg += sp.gapExtend ; }
+		      else // extend, or open from here
+			{ I64 e = *mg + sp.gapExtend, o = *ms + sp.gapOpen ;
+			  if (o > e) { *mg = o ; *mgc = *mc ; } else *mg = e ;
+			}
 		      if (*mg >= ONE) match->isGap = true ;
 		    }
 		}
+	      if (arrayMax(match->aNode) > match->nodeLimit) copyNodeCompact (match, q->len) ;
 	      // finally, check if done, and if so then process match
 	      ms = match->score ;
 	      bool isDone = true ;
@@ -211,9 +307,12 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	      else
 		{
 		  // update bestScore if necessary
-		  I64 mEnd = match->score[(32*(q->len-1)) % q->len] ;
+		  int kEnd = (32*(q->len-1)) % q->len ;
+		  I64 mEnd = match->score[kEnd] ;
 		  if ((newEnd >= ONE) && mEnd && (mEnd + newEnd > match->bestScore))
-		    { match->bestScore = mEnd + newEnd ; match->bestEnd = i + 32 ; }
+		    { match->bestScore = mEnd + newEnd ; match->bestEnd = i + 32 ;
+		      match->bestNode = match->copy[kEnd] ;
+		    }
 		}
 
 	      if ((match->score[32 % q->len] >> 32) >= (newStart >> 32)) newStart = 0 ; // don't restart a new one: compare scores only, not match counts
@@ -228,16 +327,22 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	      match->next = w->active[j] ; w->active[j] = match ; // link into list
 	      I64 *ms = match->score = new0 (q->len, I64) ;
 	      match->gap = new0 (q->len, I64) ;
+	      U32 *mc = match->copy = new0 (q->len, U32) ;
+	      match->gapCopy = new0 (q->len, U32) ;
+	      match->aNode = arrayCreate (1024, CopyNode) ;
+	      match->nodeLimit = 4*q->len + 1024 ;
+	      U32 c = copyNodeAdd (match, i-32, 0) ; // node 0 is the match start
+	      for (int m = q->len ; m <= 32 ; m += q->len) c = copyNodeAdd (match, i-32+m, c) ; // copies in the seed
 	      int k = 32 % q->len ;
-	      ms[k] = newStart ;
+	      ms[k] = newStart ; mc[k] = c ;
 	      I64 d = newStart + sp.gapOpen ;
 	      if (d >= ONE)
 		{ match->isGap = true ;
-		  match->gap[k] = d ;
+		  match->gap[k] = d ; match->gapCopy[k] = c ;
 		  while (d >= ONE)
-		    { if (++k == q->len) k = 0 ;
+		    { if (++k == q->len) { k = 0 ; c = copyNodeAdd (match, i+1, c) ; }
 		      if (ms[k] >= d) break ;
-		      ms[k] = d ;
+		      ms[k] = d ; mc[k] = c ;
 		      d += sp.gapExtend ;
 		    }
 		}
@@ -570,11 +675,16 @@ int main (int argc, char *argv[])
       U64    count = m->bestScore & 0xffffffff ;
       char   strand = q->isRC ? '-' : '+' ;
       if (outFile)
-	fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\t%c\n", tName, m->start, m->bestEnd, qName,
-		 (U64)(m->bestScore >> 32), count, strand) ;
+	{ fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\t%c\t", tName, m->start, m->bestEnd, qName,
+		   (U64)(m->bestScore >> 32), count, strand) ;
+	  if (!m->nParse) fputc ('.', outFile) ; // just one copy
+	  for (int k = 0 ; k < m->nParse ; ++k) fprintf (outFile, k ? ",%u" : "%u", m->parse[k]) ;
+	  fputc ('\n', outFile) ;
+	}
       if (bedFile)
 	fprintf (bedFile, "%s\t%llu\t%llu\t%s\t%d\t%c\n", tName, m->start, m->bestEnd, qName,
 		 (int)(1000 * count / (m->bestEnd - m->start)), strand) ;
+      newFree (m->parse, m->nParse ? m->nParse : 1, U32) ;
       newFree (m, 1, Match) ;
     }
 
