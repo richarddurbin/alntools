@@ -94,33 +94,37 @@ Options are:
 
 ## satscan
 
-scans a genome sequence file for arrays of satellite repeat units, for example the representative unit sequences written by `satmatch -fa`, and reports each array that matches a unit.  Each unit is tried on both strands.  A match starts where 32bp of the target scores positively, with no gaps, against the first 32bp of the unit, and is then extended by affine-gap dynamic programming around the unit treated as a circle, so it can run through any number of copies of the repeat and tolerate substitutions and indels.  It ends at the best scoring point at which the last 32bp of the target again score positively, without gaps, against the end of the unit.  Matches are reported if their score is above `-smin`.  Example usage is, for the human genome and the 171bp centromeric alpha satellite unit:
+scans a genome sequence file for arrays of satellite repeat units, for example the representative unit sequences written by `satmatch -fa`, and reports each array that matches a unit.  Each unit is tried on both strands.  The units can be given as a FASTA (or other sequence) file, or as a ONEcode `.1seq` or `.1lib` repeat library file; from a `.1lib` file only entries whose type (`Y` line) starts with "tandem" are used, while entries with no type are used as for FASTA.
+
+A match starts where 32bp of the target scores positively, with no gaps, against the first 32bp of the unit, and is then extended by affine-gap dynamic programming around the unit treated as a circle, so it can run through any number of copies of the repeat and tolerate substitutions and indels.  It ends at the best scoring point at which the next 32bp of the target again score positively, without gaps, against the last 32bp of the unit, so every match is a whole number of copies of the unit.  To stop a match running on through unrelated sequence, any alignment that falls more than an x-drop below the best score the match has reached so far is abandoned: the x-drop is the larger of `-xmin` (default 100) and `-xfac` (default 1.0) times the unit length.  So a long stretch of poor similarity ends a match, and the array beyond it is reported as a separate match.  Matches are reported if their score is above `-smin`.  Example usage is, for the human genome and the 171bp centromeric alpha satellite unit:
 
 ```
 > satscan -o mHomSap-cen.tsv -bed mHomSap-cen.bed mHomSap-cen.fa mHomSap.fa.gz
 read in 1 query sequences, total length 171 bp
-chr3 length 201105948: 4974 starts, 5 matches, total match length 3159469, 8.23 s
-chr2 length 242696752: 6187 starts, 6 matches, total match length 2509879, 8.89 s
-chr6 length 172126628: 4339 starts, 6 matches, total match length 3213332, 8.04 s
+chr3 length 201105948: 2607 starts, 32 matches, total match length 2627725, 6.98 s
+chr2 length 242696752: 3227 starts, 15 matches, total match length 2496154, 7.72 s
+chr4 length 193574945: 2646 starts, 16 matches, total match length 3831956, 7.44 s
 ...
 processed 25 target sequences, total length 3117292070 bp
-found 72105 starts, 376 matches, total match length 83079609 bp
-user	176.639831	system	0.598949	elapsed 26.322544	alloc_max 3203 MB	max_RSS	3439017984
+found 38108 starts, 1329 matches, total match length 83210036 bp
+user	140.879831	system	0.686588	elapsed 20.433020	alloc_max 3348 MB	max_RSS	3444834304
 > head -3 mHomSap-cen.tsv
-chr1	103897763	103898275	cen-171	78	352	+
-chr1	103908986	103911559	cen-171	472	1839	+
-chr1	121619161	121795996	cen-171	78459	143024	-
+chr1	103897934	103911559	cen-171	1856	9585	+	170,341,513,683,...
+chr1	121619161	121677149	cen-171	27382	47395	-	167,336,504,674,...
+chr1	121677647	121787894	cen-171	52519	89508	-	167,337,505,676,...
 > head -3 mHomSap-cen.bed
-chr1	103897763	103898275	cen-171	687	+
-chr1	103908986	103911559	cen-171	714	+
-chr1	121619161	121795996	cen-171	808	-
+chr1	103897934	103911559	cen-171	703	+
+chr1	121619161	121677149	cen-171	817	-
+chr1	121677647	121787894	cen-171	811	-
 ```
 
-The progress lines are written to stderr, one for each target sequence as its scan finishes (so not necessarily in file order), giving the number of start windows found, the number of matches reported, their total length, and the wall time for that sequence.  The results are collected, sorted by target in file order and then by start, and written at the end.  Each line of the main output has seven tab-separated columns: the target name, the start (0-based) and end (exclusive) of the match in the target, the name of the unit sequence, the alignment score, the number of exact base matches in the alignment, and the strand, which is `-` if the reverse complement of the unit matched.  Percent identity can be calculated as 100 * (exact matches) / (end - start).  This measures exact matches against the span of the target, so bases of the unit that are skipped by a gap do not add to the denominator.  Matches from different units, or from the two strands of one unit, can overlap.
+The progress lines are written to stderr, one for each target sequence as its scan finishes (so not necessarily in file order), giving the number of start windows found, the number of matches reported, their total length, and the wall time for that sequence.  The results are collected, sorted by target in file order and then by start, and written at the end.  Each line of the main output has eight tab-separated columns: the target name, the start (0-based) and end (exclusive) of the match in the target, the name of the unit sequence, the alignment score, the number of exact base matches in the alignment, the strand, which is `-` if the reverse complement of the unit matched, and the parse of the match into copies of the unit.  The parse is a comma-separated list of the internal copy boundaries, i.e. the start of each copy after the first, relative to the start of the match, or `.` if the match is a single copy; the lists are truncated with `...` in the example above.  A copy begins where the alignment reaches the start of the unit, so its boundaries depend on the rotation of the unit sequence.  The parse uses the same convention as the `P` lines that FasTAN writes in `.1ano` files.
+
+Percent identity can be calculated as 100 * (exact matches) / (end - start).  This measures exact matches against the span of the target, so bases of the unit that are skipped by a gap do not add to the denominator.  Matches from different units, or from the two strands of one unit, can overlap, but if two matches of the same unit on the same strand end at the same place then only the better one is kept, and the number removed is reported on stderr.
 
 With `-bed <file>` a standard [BED](https://en.wikipedia.org/wiki/BED_(file_format)) file with six columns is also written: the target, start, end, unit name, the identity in parts per thousand, `(int)(1000*matches/(end-start))`, in the score column, and the strand.  If `-bed` is given without `-o` then nothing is written to standard output; if both are given then both files are written.
 
-The default scoring is +1 for a match, -1 for a transition, -2 for a transversion, and -7 for the first position of a gap plus -1 for each further position.  Tied alignments are resolved in favour of more exact matches.  The sequences are scanned by `-T` threads (default 8), each working on one target sequence at a time, so the time is limited by the longest sequence; the results are the same for any number of threads.  Up to about two sequences per thread are held in memory at once.  As an indication of speed, scanning the 3.1Gb human genome for the single 171bp unit above took about 26 seconds with the default 8 threads, and for 12 units of 20 to 171bp about 2.5 minutes.
+The default scoring is +1 for a match, -1 for a transition, -2 for a transversion, and -7 for the first position of a gap plus -1 for each further position.  Tied alignments are resolved in favour of more exact matches.  The sequences are scanned by `-T` threads (default 8), each working on one target sequence at a time, so the time is limited by the longest sequence; the results are the same for any number of threads.  Up to about two sequences per thread are held in memory at once.  As an indication of speed, scanning the 3.1Gb human genome for the single 171bp unit above took about 20 seconds with the default 8 threads, and for 12 units of 20 to 171bp about 2.3 minutes.
 
 Options are:
 
@@ -134,6 +138,8 @@ Options are:
 | `-gapOpen <n>` | score for the first position of a gap, must be negative (default -7) |
 | `-gapExtend <n>` | score for each further position of a gap, must be negative (default -1) |
 | `-smin <n>` | minimum score to report a match (default 50) |
+| `-xmin <n>` | minimum x-drop (default 100) |
+| `-xfac <x>` | the x-drop is the larger of `-xmin` and this times the unit length (default 1.0) |
 | `-T <n>` | number of scanning threads (default 8) |
 
 ## gdbmask
