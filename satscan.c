@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 20 09:30 2026 (claude)
+ * Last edited: Oct 20 11:40 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -48,7 +48,6 @@ typedef struct MatchStruct {
   int  query ;     // index in aQuery
   int  target ;    // index of the target sequence, in file order
   struct MatchStruct  *next ;      // index of nextMatch in aMatch
-  bool isGap ;     // if we need to update gap
 } Match ;
 
 typedef struct {
@@ -278,21 +277,17 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 		      }
 		    ms[k] = d ; mc[k] = dc ;
 		  }
-	      // next if necessary do the down gaps
-	      if (match->isGap)
-		{ ms = match->score ; mc = match->copy ;
-		  I64 *mg = match->gap ;
-		  U32 *mgc = match->gapCopy ;
-		  match->isGap = false ;
-		  for (int k = 0 ; k < q->len ; ++k, ++ms, ++mg, ++mc, ++mgc)
-		    { if (*mg > *ms) { *ms = *mg ; *mc = *mgc ; *mg += sp.gapExtend ; }
-		      else // extend, or open from here
-			{ I64 e = *mg + sp.gapExtend, o = *ms + sp.gapOpen ;
-			  if (o > e) { *mg = o ; *mgc = *mc ; } else *mg = e ;
-			}
-		      if (*mg >= ONE) match->isGap = true ;
+	      // next the down gaps, always: a gap can open from any cell, even after a low patch
+	      { ms = match->score ; mc = match->copy ;
+		I64 *mg = match->gap ;
+		U32 *mgc = match->gapCopy ;
+		for (int k = 0 ; k < q->len ; ++k, ++ms, ++mg, ++mc, ++mgc)
+		  if (*mg > *ms) { *ms = *mg ; *mc = *mgc ; *mg += sp.gapExtend ; }
+		  else // extend, or open from here
+		    { I64 e = *mg + sp.gapExtend, o = *ms + sp.gapOpen ;
+		      if (o > e) { *mg = o ; *mgc = *mc ; } else *mg = e ;
 		    }
-		}
+	      }
 	      if (arrayMax(match->aNode) > match->nodeLimit) copyNodeCompact (match, q->len) ;
 	      // finally, check if done, and if so then process match
 	      ms = match->score ;
@@ -338,8 +333,7 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	      ms[k] = newStart ; mc[k] = c ;
 	      I64 d = newStart + sp.gapOpen ;
 	      if (d >= ONE)
-		{ match->isGap = true ;
-		  match->gap[k] = d ; match->gapCopy[k] = c ;
+		{ match->gap[k] = d ; match->gapCopy[k] = c ;
 		  while (d >= ONE)
 		    { if (++k == q->len) { k = 0 ; c = copyNodeAdd (match, i+1, c) ; }
 		      if (ms[k] >= d) break ;
