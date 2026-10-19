@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 19 00:19 2026 (rd109)
+ * Last edited: Oct 20 09:30 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -193,11 +193,11 @@ static void matchParse (Match *match, Query *q)
   int n = 0 ;
   for (U32 c = match->bestNode ; c ; c = node[c].prev) ++n ;
   U64 endStart = match->bestEnd - 32 - match->start ; // the final 32bp, aligned ungapped to the end of the unit
-  for (int k = 1 ; k < 32 ; ++k) if ((32 - k) % q->len == 0) ++n ; // copies starting inside that
+  for (int k = 0 ; k < 32 ; ++k) if ((32 - k) % q->len == 0) ++n ; // copies starting inside that
   match->nParse = n ;
   match->parse = new (n ? n : 1, U32) ;
   int i = n ;
-  for (int k = 31 ; k > 0 ; --k) if ((32 - k) % q->len == 0) match->parse[--i] = endStart + k ;
+  for (int k = 31 ; k >= 0 ; --k) if ((32 - k) % q->len == 0) match->parse[--i] = endStart + k ;
   for (U32 c = match->bestNode ; c ; c = node[c].prev) match->parse[--i] = node[c].pos ;
 }
 
@@ -235,8 +235,9 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	{ Query *q  = arrp(aQuery, j, Query) ;
 	  char  *qs = q->seq ;
 	  I64 newStart = 0 ; for (int k = 0 ; k < 32 ; ++k) newStart += q->startScore[k][(int)s[k-32]] ;
-	  I64 newEnd = 0 ;
-	  if (i < job->len - 32) for (int k = 0 ; k < 32 ; ++k) newEnd += q->endScore[k][(int)s[k]] ;
+	  if (newStart >= ONE) newStart += bs[(int)qs[32 % q->len]] ; // the seed cell is (q[32%len], t[i])
+	  I64 newEnd = 0 ; // the end window starts at t[i+1], after the cell for q[len-33] at t[i]
+	  if (i < job->len - 32) for (int k = 0 ; k < 32 ; ++k) newEnd += q->endScore[k][(int)s[k+1]] ;
 	  Match *lastMatch = 0, *next ;
 	  for (Match *match = w->active[j] ; match ; match = next)
 	    {
@@ -307,10 +308,10 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	      else
 		{
 		  // update bestScore if necessary
-		  int kEnd = (32*(q->len-1)) % q->len ;
+		  int kEnd = (33*(q->len-1)) % q->len ; // q[-33 mod len]: the end window covers the next 32
 		  I64 mEnd = match->score[kEnd] ;
 		  if ((newEnd >= ONE) && mEnd && (mEnd + newEnd > match->bestScore))
-		    { match->bestScore = mEnd + newEnd ; match->bestEnd = i + 32 ;
+		    { match->bestScore = mEnd + newEnd ; match->bestEnd = i + 33 ;
 		      match->bestNode = match->copy[kEnd] ;
 		    }
 		}
