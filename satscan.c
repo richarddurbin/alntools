@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 19 00:19 2026 (rd109)
+ * Last edited: Oct 19 12:55 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -93,6 +93,8 @@ typedef struct {		// read-only once scanning starts, so can be shared between th
 typedef struct {		// everything that is private to one scanning thread
   Match **active ;		// [nQuery] heads of the lists of active matches for each query
   Array   aMatch ;		// Match* to report: score and gap are freed, so these are small
+  I64    *gapIn ;		// [maxLen] scratch: right gap value arriving at each cell on the first pass
+  int     maxLen ;		// longest query
   U64     totStart, totMatch, totMatchLen ; // summed over all the targets this worker did
 } Worker ;
 
@@ -119,11 +121,15 @@ static Worker *workerCreate (ScanParams *scan)
 { Worker *w = new0 (1, Worker) ;
   w->active = new0 (arrayMax(scan->aQuery), Match*) ;
   w->aMatch = arrayCreate (256, Match*) ;
+  for (int j = 0 ; j < arrayMax(scan->aQuery) ; ++j)
+    if (arrp(scan->aQuery, j, Query)->len > w->maxLen) w->maxLen = arrp(scan->aQuery, j, Query)->len ;
+  w->gapIn = new (w->maxLen, I64) ;
   return w ;
 }
 
 static void workerDestroy (Worker *w, ScanParams *scan)
 { newFree (w->active, arrayMax(scan->aQuery), Match*) ;
+  newFree (w->gapIn, w->maxLen, I64) ;
   arrayDestroy (w->aMatch) ;
   newFree (w, 1, Worker) ;
 }
@@ -171,12 +177,15 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	      // next right gaps
 	      ms = match->score ;
 	      I64 d = ms[q->len-1] + sp.gapOpen ;
+	      I64 *gi = w->gapIn ;
 	      for (int k = 0 ; k < q->len ; ++k, ++ms)
-		if (d > *ms) { *ms = d ; d += sp.gapExtend ; }
+		if ((*gi++ = d) > *ms) { *ms = d ; d += sp.gapExtend ; }
 		else { I64 e = d + sp.gapExtend, o = *ms + sp.gapOpen ; d = (o > e) ? o : e ; } // extend, or open from here
-	      ms = match->score ; // extend wrap-around as far as needed
-	      for (int k = 0 ; d > *ms ; ++k)
-		{ *ms++ = d ; d += sp.gapExtend ; }
+	      // Extend the wrap-around while it beats the gap that arrived at each cell on the first pass:
+	      // it can pass cells it doesn't improve, but once below that value it can't win further on.
+	      ms = match->score ; gi = w->gapIn ;
+	      for (int k = 0 ; k < q->len && d > gi[k] ; ++k, d += sp.gapExtend)
+		if (d > ms[k]) ms[k] = d ;
 	      // next if necessary do the down gaps
 	      if (match->isGap)
 		{ ms = match->score ;
