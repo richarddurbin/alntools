@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 20 16:10 2026 (claude)
+ * Last edited: Oct 20 22:40 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -111,7 +111,7 @@ typedef struct {		// everything that is private to one scanning thread
   Array   aMatch ;		// Match* to report: score and gap are freed, so these are small
   I64    *gapIn ;		// [maxLen] scratch: right gap value arriving at each cell on the first pass
   int     maxLen ;		// longest query
-  U64     totStart, totMatch, totMatchLen ; // summed over all the targets this worker did
+  U64     totStart, totMatch, totMatchLen, totSameEnd ; // summed over all the targets this worker did
 } Worker ;
 
 typedef struct {
@@ -123,7 +123,8 @@ typedef struct {
 } Job ;
 
 typedef struct {
-  U64    nStart, nMatch, matchLen ;
+  U64    nStart, nMatch, matchLen ; // nMatch and matchLen are after removeSameEnd()
+  U64    nSameEnd ;		// matches removed because a better one of the same query ends at the same place
   double seconds ;		// wall time
 } ScanStats ;
 
@@ -221,12 +222,48 @@ static void matchFinish (Worker *w, ScanParams *scan, Match *match, Query *q, Sc
     newFree (match, 1, Match) ;
 }
 
+// groups matches with the same target, query (so strand) and end, best first: higher score, then
+// higher match count, then earlier start, so the choice is deterministic
+static int sameEndOrder (const void *a, const void *b)
+{
+  const Match *x = *(Match* const*)a, *y = *(Match* const*)b ;
+  if (x->target != y->target) return x->target < y->target ? -1 : 1 ;
+  if (x->query != y->query) return x->query < y->query ? -1 : 1 ;
+  if (x->bestEnd != y->bestEnd) return x->bestEnd < y->bestEnd ? -1 : 1 ;
+  if (x->bestScore != y->bestScore) return x->bestScore > y->bestScore ? -1 : 1 ; // packed: score, then count
+  if (x->start != y->start) return x->start < y->start ? -1 : 1 ;
+  return 0 ;
+}
+
+// keep only the best of the matches in aMatch from i0 on (all from one target) that share a query and
+// end, updating the counts in st
+static void removeSameEnd (Array aMatch, U64 i0, ScanStats *st)
+{
+  U64 nIn = arrayMax(aMatch) - i0 ;
+  if (nIn < 2) return ;
+  Match **mm = arrp(aMatch, i0, Match*) ;
+  qsort (mm, nIn, sizeof(Match*), sameEndOrder) ;
+  U64 n = 0 ;
+  for (U64 i = 0 ; i < nIn ; ++i)
+    { Match *m = mm[i], *keep = n ? mm[n-1] : 0 ;
+      if (keep && keep->query == m->query && keep->bestEnd == m->bestEnd)
+	{ --st->nMatch ; st->matchLen -= m->bestEnd - m->start ; ++st->nSameEnd ;
+	  newFree (m->parse, m->nParse ? m->nParse : 1, U32) ; newFree (m, 1, Match) ;
+	}
+      else
+	mm[n++] = m ;
+    }
+  arrayMax(aMatch) = i0 + n ;
+}
+
+
 static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 {
   Array aQuery = scan->aQuery ;
   const ScoreParams sp = scan->sp ;
   int nQuery = arrayMax(aQuery) ;
   memset (st, 0, sizeof(ScanStats)) ;
+  U64 i0 = arrayMax(w->aMatch) ; // this target's matches are added from here
   double t0 = wallTime () ;
 
   char *s = job->seq + 32 ;
@@ -362,6 +399,7 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	}
       w->active[j] = 0 ;
     }
+  removeSameEnd (w->aMatch, i0, st) ;
   st->seconds = wallTime () - t0 ;
 }
 
@@ -377,7 +415,7 @@ static void workerRun (ScanParams *scan, Worker *w, Job *job)
   ScanStats st ;
   scanTarget (scan, w, job, &st) ;
   reportTarget (job, &st) ;
-  w->totStart += st.nStart ; w->totMatch += st.nMatch ; w->totMatchLen += st.matchLen ;
+  w->totStart += st.nStart ; w->totMatch += st.nMatch ; w->totMatchLen += st.matchLen ; w->totSameEnd += st.nSameEnd ;
   if (job->ownsSeq) newFree (job->seq, job->len, char) ;
 }
 
@@ -463,37 +501,6 @@ static int matchOrder (const void *a, const void *b)
   if (xq != yq) return xq < yq ? -1 : 1 ;
   if (x->query != y->query) return x->query < y->query ? -1 : 1 ;
   return 0 ;
-}
-
-// groups matches with the same target, query (so strand) and end, best first: higher score, then
-// higher match count, then earlier start, so the choice is deterministic
-static int sameEndOrder (const void *a, const void *b)
-{
-  const Match *x = *(Match* const*)a, *y = *(Match* const*)b ;
-  if (x->target != y->target) return x->target < y->target ? -1 : 1 ;
-  if (x->query != y->query) return x->query < y->query ? -1 : 1 ;
-  if (x->bestEnd != y->bestEnd) return x->bestEnd < y->bestEnd ? -1 : 1 ;
-  if (x->bestScore != y->bestScore) return x->bestScore > y->bestScore ? -1 : 1 ; // packed: score, then count
-  if (x->start != y->start) return x->start < y->start ? -1 : 1 ;
-  return 0 ;
-}
-
-// keep only the best of matches with the same target, query and end; returns the number removed
-static U64 removeSameEnd (Array aMatch)
-{
-  arraySort (aMatch, sameEndOrder) ;
-  U64 n = 0 ;
-  for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
-    { Match *m = arr(aMatch, i, Match*) ;
-      Match *keep = n ? arr(aMatch, n-1, Match*) : 0 ;
-      if (keep && keep->target == m->target && keep->query == m->query && keep->bestEnd == m->bestEnd)
-	{ newFree (m->parse, m->nParse ? m->nParse : 1, U32) ; newFree (m, 1, Match) ; }
-      else
-	arr(aMatch, n++, Match*) = m ;
-    }
-  U64 nRemoved = arrayMax(aMatch) - n ;
-  arrayMax(aMatch) = n ;
-  return nRemoved ;
 }
 
 int main (int argc, char *argv[])
@@ -709,16 +716,15 @@ int main (int argc, char *argv[])
     }
 
   // gather the matches from all the workers into the first worker's array, then sort and write
-  U64 totStart = 0, totMatch = 0, totMatchLen = 0 ;
+  U64 totStart = 0, totMatch = 0, totMatchLen = 0, totSameEnd = 0 ;
   Array aMatch = worker[0]->aMatch ;
   for (int t = 0 ; t < nThread ; ++t)
     { Worker *w = worker[t] ;
-      totStart += w->totStart ; totMatch += w->totMatch ; totMatchLen += w->totMatchLen ;
+      totStart += w->totStart ; totMatch += w->totMatch ; totMatchLen += w->totMatchLen ; totSameEnd += w->totSameEnd ;
       if (t)
 	for (U64 i = 0 ; i < arrayMax(w->aMatch) ; ++i)
 	  array(aMatch, arrayMax(aMatch), Match*) = arr(w->aMatch, i, Match*) ;
     }
-  U64 nSameEnd = removeSameEnd (aMatch) ;
   arraySort (aMatch, matchOrder) ;
   for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
     { Match *m = arr(aMatch, i, Match*) ;
@@ -744,7 +750,7 @@ int main (int argc, char *argv[])
   fprintf (stderr, "processed %llu target sequences, total length %llu bp\n", nSeq, totSeq) ;
   fprintf (stderr, "found %llu starts, %llu matches, total match length %llu bp\n",
 	   totStart, totMatch, totMatchLen) ;
-  if (nSameEnd) fprintf (stderr, "removed %llu matches ending where a better one of the same query ends\n", nSameEnd) ;
+  if (totSameEnd) fprintf (stderr, "(after removing %llu matches ending where a better one of the same query ends)\n", totSameEnd) ;
   timeTotal(stderr) ;
 
   if (outFile && outFile != stdout) fclose (outFile) ;
