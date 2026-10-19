@@ -3,7 +3,7 @@
 CFLAGS = -O3 -DUTILS_THREADSAFE
 #CFLAGS = -g -DUTILS_THREADSAFE	# for debugging
 
-LIBS = -lpthread -lz
+LIBS = -lpthread -lz -lm
 
 ALL = tanbed gdbmask svfind taco ONEview tancons satmatch satscan
 
