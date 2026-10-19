@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 20 13:40 2026 (claude)
+ * Last edited: Oct 20 16:10 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -618,7 +618,9 @@ int main (int argc, char *argv[])
 	      isTandem = false ;
 	  if (isTandem)
 	    { if (!q->name)
-		{ q->name = new (16, char) ; sprintf (q->name, "tandem-%d", nEntry) ; }
+		{ char buf[32] ; sprintf (buf, "tandem-%d", nEntry) ;
+		  q->name = new (strlen(buf)+1, char) ; strcpy (q->name, buf) ;
+		}
 	    }
 	  else
 	    { ++nSkip ; newFree (q->seq, q->len, char) ;
@@ -684,7 +686,7 @@ int main (int argc, char *argv[])
       if (sio->seqLen < 32) continue ;
       Job job ;
       job.target = arrayMax(aTargetName) ;
-      job.name = strdup (sqioId(sio)) ;
+      job.name = new (strlen(sqioId(sio))+1, char) ; strcpy (job.name, sqioId(sio)) ;
       array(aTargetName, job.target, char*) = job.name ;
       job.len = sio->seqLen ;
       if (nThread == 1)
@@ -747,7 +749,8 @@ int main (int argc, char *argv[])
 
   if (outFile && outFile != stdout) fclose (outFile) ;
   if (bedFile) fclose (bedFile) ;
-  for (U64 i = 0 ; i < arrayMax(aTargetName) ; ++i) free (arr(aTargetName, i, char*)) ;
+  for (U64 i = 0 ; i < arrayMax(aTargetName) ; ++i)
+    { char *name = arr(aTargetName, i, char*) ; newFree (name, strlen(name)+1, char) ; }
   arrayDestroy (aTargetName) ;
   for (int t = 0 ; t < nThread ; ++t) workerDestroy (worker[t], &scan) ;
   newFree (worker, nThread, Worker*) ;
