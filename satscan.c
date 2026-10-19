@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 20 11:40 2026 (claude)
+ * Last edited: Oct 20 13:40 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -35,6 +35,7 @@ typedef struct {
 typedef struct MatchStruct {
   U64  start ;	   // position in current sequence
   I64  bestScore ; // best score so far at end of a query unit
+  I64  maxScore ;  // best cell score so far, for the x-drop
   U64  bestEnd ;   // end position of bestScore
   I64 *score ;     // length q->len - must be positive
   I64 *gap ;       // length q->len
@@ -58,6 +59,7 @@ typedef struct {
   char *seq ;
   I64   startScore[32][4] ;
   I64   endScore[32][4] ;
+  I64   xDrop ;     // cells more than this below the match's best cell so far are dropped, times ONE
 } Query ;
 
 typedef struct {
@@ -291,10 +293,15 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	      if (arrayMax(match->aNode) > match->nodeLimit) copyNodeCompact (match, q->len) ;
 	      // finally, check if done, and if so then process match
 	      ms = match->score ;
+	      // A cell is alive if its score is > 0, whatever the match count, and it is within xDrop of
+	      // the best cell so far, so no reported path can lose more than xDrop over any stretch.
 	      bool isDone = true ;
+	      I64 minLive = match->maxScore - q->xDrop, colMax = 0 ;
+	      if (minLive < ONE) minLive = ONE ;
 	      for (int k = 0 ; k < q->len ; ++k, ++ms)
-		if (*ms >= ONE) isDone = false ; // alive means score > 0, whatever the match count
+		if (*ms >= minLive) { isDone = false ; if (*ms > colMax) colMax = *ms ; }
 		else *ms = 0 ;
+	      if (colMax > match->maxScore) match->maxScore = colMax ;
 	      if (isDone)
 		{ if (lastMatch) lastMatch->next = next ; else w->active[j] = next ;
 		  matchFinish (w, scan, match, q, st) ;
@@ -331,6 +338,7 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	      for (int m = q->len ; m <= 32 ; m += q->len) c = copyNodeAdd (match, i-32+m, c) ; // copies in the seed
 	      int k = 32 % q->len ;
 	      ms[k] = newStart ; mc[k] = c ;
+	      match->maxScore = newStart ;
 	      I64 d = newStart + sp.gapOpen ;
 	      if (d >= ONE)
 		{ match->gap[k] = d ; match->gapCopy[k] = c ;
@@ -473,12 +481,16 @@ int main (int argc, char *argv[])
     "    -gapOpen <n>       gap open score [-7]\n"
     "    -gapExtend <n>     gap extend score [-1]\n"
     "    -smin <n>          minimum score to report [50]\n"
+    "    -xmin <n>          minimum x-drop: a match drops cells more than the x-drop below its best [100]\n"
+    "    -xfac <x>          x-drop is the larger of xmin and xfac times the unit length [1.0]\n"
     "    -T <n>             number of scanning threads [8]\n" ;
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
   FILE *outFile = 0, *bedFile = 0 ;	// outFile defaults to stdout unless -bed is given
   ScoreParams sp = {1,-1,-2,-7*ONE,-1*ONE} ;
   U64 scoreMin = 50 ;
+  int xMin = 100 ;
+  double xFac = 1.0 ;
   int nThread = 8 ;
 
   /* Process command line options */
@@ -520,6 +532,16 @@ int main (int argc, char *argv[])
       else if (!strcmp (*argv, "-T") && argc > 1)
         { nThread = atoi (*++argv) ;
           if (nThread < 1) die ("bad number of threads %s - must be at least 1\n%s", *argv, usage) ;
+          argc-- ;
+        }
+      else if (!strcmp (*argv, "-xmin") && argc > 1)
+        { xMin = atoi (*++argv) ;
+          if (xMin <= 0) die ("bad xmin %s - must be +ve\n%s", *argv, usage) ;
+          argc-- ;
+        }
+      else if (!strcmp (*argv, "-xfac") && argc > 1)
+        { xFac = atof (*++argv) ;
+          if (xFac < 0) die ("bad xfac %s - must be non-negative\n%s", *argv, usage) ;
           argc-- ;
         }
       else if (!strcmp (*argv, "-smin") && argc > 1)
@@ -596,6 +618,8 @@ int main (int argc, char *argv[])
       qr->seq = seqRevComp (q->seq, q->len) ;
       makeStartScore (q) ; makeEndScore (q) ;
       makeStartScore (qr) ; makeEndScore (qr) ;
+      I64 x = (I64)(xFac * q->len + 0.5) ;
+      q->xDrop = qr->xDrop = (x > xMin ? x : xMin) * ONE ;
       totSat += q->len ;
     }
   --argc ; ++argv ;
