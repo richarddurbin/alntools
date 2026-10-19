@@ -465,6 +465,37 @@ static int matchOrder (const void *a, const void *b)
   return 0 ;
 }
 
+// groups matches with the same target, query (so strand) and end, best first: higher score, then
+// higher match count, then earlier start, so the choice is deterministic
+static int sameEndOrder (const void *a, const void *b)
+{
+  const Match *x = *(Match* const*)a, *y = *(Match* const*)b ;
+  if (x->target != y->target) return x->target < y->target ? -1 : 1 ;
+  if (x->query != y->query) return x->query < y->query ? -1 : 1 ;
+  if (x->bestEnd != y->bestEnd) return x->bestEnd < y->bestEnd ? -1 : 1 ;
+  if (x->bestScore != y->bestScore) return x->bestScore > y->bestScore ? -1 : 1 ; // packed: score, then count
+  if (x->start != y->start) return x->start < y->start ? -1 : 1 ;
+  return 0 ;
+}
+
+// keep only the best of matches with the same target, query and end; returns the number removed
+static U64 removeSameEnd (Array aMatch)
+{
+  arraySort (aMatch, sameEndOrder) ;
+  U64 n = 0 ;
+  for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
+    { Match *m = arr(aMatch, i, Match*) ;
+      Match *keep = n ? arr(aMatch, n-1, Match*) : 0 ;
+      if (keep && keep->target == m->target && keep->query == m->query && keep->bestEnd == m->bestEnd)
+	{ newFree (m->parse, m->nParse ? m->nParse : 1, U32) ; newFree (m, 1, Match) ; }
+      else
+	arr(aMatch, n++, Match*) = m ;
+    }
+  U64 nRemoved = arrayMax(aMatch) - n ;
+  arrayMax(aMatch) = n ;
+  return nRemoved ;
+}
+
 int main (int argc, char *argv[])
 {
   timeUpdate (0) ;
@@ -685,6 +716,7 @@ int main (int argc, char *argv[])
 	for (U64 i = 0 ; i < arrayMax(w->aMatch) ; ++i)
 	  array(aMatch, arrayMax(aMatch), Match*) = arr(w->aMatch, i, Match*) ;
     }
+  U64 nSameEnd = removeSameEnd (aMatch) ;
   arraySort (aMatch, matchOrder) ;
   for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
     { Match *m = arr(aMatch, i, Match*) ;
@@ -710,6 +742,7 @@ int main (int argc, char *argv[])
   fprintf (stderr, "processed %llu target sequences, total length %llu bp\n", nSeq, totSeq) ;
   fprintf (stderr, "found %llu starts, %llu matches, total match length %llu bp\n",
 	   totStart, totMatch, totMatchLen) ;
+  if (nSameEnd) fprintf (stderr, "removed %llu matches ending where a better one of the same query ends\n", nSameEnd) ;
   timeTotal(stderr) ;
 
   if (outFile && outFile != stdout) fclose (outFile) ;
