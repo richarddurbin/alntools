@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 21 13:30 2026 (claude)
+ * Last edited: Oct 20 22:45 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -264,13 +264,15 @@ static void matchParse (Match *match, Query *q)
 
 /********** dangerous regions, where chance matches are likely, and the scheme to use in them **********/
 
-// positive root of sum_a g_a exp(lambda W_a) = 1, which exists when sum_a g_a W_a < 0 and some W_a > 0
+// positive root of sum_a g_a exp(lambda W_a) = 1, which exists when sum_a g_a W_a < 0 and W_a > 0 for
+// some a with g_a > 0; the caller must check both
 static double dangerLambda (I64 *W, double *g)
 {
   double lo = 0, hi = 1e-6 ;
-  for (;;)
+  for (int it = 0 ; ; ++it)
     { double f = -1 ; for (int a = 0 ; a < 4 ; ++a) f += g[a] * exp (hi * W[a]) ;
       if (f > 0) break ;
+      if (it == 1000) die ("dangerLambda failed to find an upper bound") ; // no positive weight with g > 0
       hi *= 2 ;
     }
   for (int it = 0 ; it < 100 ; ++it)
@@ -323,9 +325,9 @@ static void dangerLevels (ScanParams *scan, Worker *w, char *seq, U64 len)
       for (int s = 0 ; s < scan->nScheme ; ++s)
 	{ Array aSeg = w->aSeg[s] ; arrayMax(aSeg) = 0 ;
 	  if (prev && !arrayMax(prev)) { prev = aSeg ; continue ; } // nothing dangerous for a weaker scheme
-	  I64 *W = q->dangerWeight[s], wMax = W[0] ;
+	  I64 *W = q->dangerWeight[s], wMax = 0 ; // largest weight of a base present: if <= 0, nothing is dangerous
 	  double mean = 0 ;
-	  for (int a = 0 ; a < 4 ; ++a) { mean += g[a] * W[a] ; if (W[a] > wMax) wMax = W[a] ; }
+	  for (int a = 0 ; a < 4 ; ++a) { mean += g[a] * W[a] ; if (g[a] > 0 && W[a] > wMax) wMax = W[a] ; }
 	  if (mean >= 0) // the composition of the whole target is dangerous: all of prev is
 	    { if (!prev) { Segment *sg = arrayp (aSeg, 0, Segment) ; sg->start = 0 ; sg->end = len ; }
 	      else for (U64 k = 0 ; k < arrayMax(prev) ; ++k) array (aSeg, k, Segment) = arr (prev, k, Segment) ;
