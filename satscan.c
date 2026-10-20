@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 20 22:45 2026 (claude)
+ * Last edited: Oct 21 00:32 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -25,6 +25,8 @@
 // comparing packed values compares scores first and then prefers more exact matches.
 // NB the match count would carry into the score at 2^32 exact matches in one alignment.
 #define ONE ((I64)1 << 32)
+
+#define MAX_SCHEME 3	// the default schemes, weak, medium and strong, described below
 
 // The copy parse (approach A'): every DP cell carries the index of the CopyNode for the start of
 // the copy of the unit that its path is in. A new node is made each time a path wraps round from the
@@ -51,6 +53,7 @@ typedef struct MatchStruct {
   int  query ;     // index in aQuery
   int  target ;    // index of the target sequence, in file order
   U8   schemes ;   // bit s set if scheme s was used somewhere in [start, bestEnd), set if reported
+  U64  schemeLen[MAX_SCHEME] ; // bases of [start, bestEnd) scanned with each scheme, set if reported
   struct MatchStruct  *next ;      // index of nextMatch in aMatch
 } Match ;
 
@@ -66,7 +69,6 @@ typedef struct {
 // region of the target, satscan uses the least strict scheme under which chance matches are unlikely
 // there, judged from base composition (see dangerLevels()). A scheme given with -score is used
 // everywhere instead. The schemes share the match score, so scores, -smin and the x-drop are comparable.
-#define MAX_SCHEME 3
 static ScoreParams defaultScheme[MAX_SCHEME] = {
   { 2, -1, -3, -15*ONE, -1*ONE },	// weak
   { 2, -2, -4, -20*ONE, -2*ONE },	// medium
@@ -142,7 +144,10 @@ typedef struct {		// read-only once scanning starts, so can be shared between th
   ScoreParams sp[MAX_SCHEME] ;
   int         nScheme ;		// 1 if -score was given, else MAX_SCHEME
   U64         scoreMin ;
+  bool        isAllowOverlaps ;	// if false, overlapping matches are resolved by excludeOverlaps()
 } ScanParams ;
+
+static int nQueryFwd ;	// number of forward queries; the reverse complements follow them in aQuery
 
 typedef struct {		// everything that is private to one scanning thread
   Match **active ;		// [nQuery] heads of the lists of active matches for each query
@@ -154,7 +159,9 @@ typedef struct {		// everything that is private to one scanning thread
   U64    *runCursor ;		// [nQuery] first run that can still matter as the scan moves along
   Array   aSeg[MAX_SCHEME] ;	// scratch Segment lists for dangerLevels()
   Array   aEvent ;		// scratch for dangerLevels()
-  U64    *regionN, *regionLen ; // [nQuery*(MAX_SCHEME+1)] count and length of regions at each level
+  U64    *nExcludedQuery ;	// [nQuery] matches of each query excluded as overlapping, over all targets
+  Array   aRunTmp ;		// scratch LevelRun for addWall()
+  U64     totExcluded, totRescanned ; // summed over all the targets this worker did
 } Worker ;
 
 typedef struct {
@@ -168,6 +175,8 @@ typedef struct {
 typedef struct {
   U64    nStart, nMatch, matchLen ; // nMatch and matchLen are after removeSameEnd()
   U64    nSameEnd ;		// matches removed because a better one of the same query ends at the same place
+  U64    nExcluded ;		// matches removed because they overlapped a better one, of any query
+  U64    nRescanned ;		// matches found by rescanning around the better ones (before any exclusion)
   double seconds ;		// wall time
 } ScanStats ;
 
@@ -190,8 +199,8 @@ static Worker *workerCreate (ScanParams *scan)
   w->runCursor = new0 (nQuery, U64) ;
   for (int s = 0 ; s < MAX_SCHEME ; ++s) w->aSeg[s] = arrayCreate (1024, Segment) ;
   w->aEvent = arrayCreate (1024, Event) ;
-  w->regionN = new0 (nQuery*(MAX_SCHEME+1), U64) ;
-  w->regionLen = new0 (nQuery*(MAX_SCHEME+1), U64) ;
+  w->aRunTmp = arrayCreate (64, LevelRun) ;
+  w->nExcludedQuery = new0 (nQuery, U64) ;
   return w ;
 }
 
@@ -204,8 +213,8 @@ static void workerDestroy (Worker *w, ScanParams *scan)
   newFree (w->runCursor, nQuery, U64) ;
   for (int s = 0 ; s < MAX_SCHEME ; ++s) arrayDestroy (w->aSeg[s]) ;
   arrayDestroy (w->aEvent) ;
-  newFree (w->regionN, nQuery*(MAX_SCHEME+1), U64) ;
-  newFree (w->regionLen, nQuery*(MAX_SCHEME+1), U64) ;
+  arrayDestroy (w->aRunTmp) ;
+  newFree (w->nExcludedQuery, nQuery, U64) ;
   arrayDestroy (w->aMatch) ;
   newFree (w, 1, Worker) ;
 }
@@ -363,10 +372,6 @@ static void dangerLevels (ScanParams *scan, Worker *w, char *seq, U64 len)
 	      else { LevelRun *r = arrayp (aRun, arrayMax(aRun), LevelRun) ; r->start = pos ; r->end = end ; r->level = level ; }
 	    }
 	}
-      for (U64 k = 0 ; k < arrayMax(w->aRun[j]) ; ++k)
-	{ LevelRun *r = arrp(w->aRun[j], k, LevelRun) ;
-	  ++w->regionN[j*(MAX_SCHEME+1) + r->level] ; w->regionLen[j*(MAX_SCHEME+1) + r->level] += r->end - r->start ;
-	}
     }
 }
 
@@ -390,19 +395,23 @@ static inline bool windowLevels (Worker *w, int j, U64 p, int *lv)
 }
 
 // the bit set of levels used over [start, end) for query j
-static U8 schemesUsed (Worker *w, int j, U64 start, U64 end)
+// set match->schemeLen[], the bases of the match scanned with each scheme, and the bit set match->schemes
+static void schemesUsed (Worker *w, Match *match)
 {
-  Array aRun = w->aRun[j] ;
-  U8 bits = 0 ; U64 covered = 0 ;
+  Array aRun = w->aRun[match->query] ;
+  U64 start = match->start, end = match->bestEnd, covered = 0 ;
+  memset (match->schemeLen, 0, sizeof(match->schemeLen)) ;
   for (U64 k = 0 ; k < arrayMax(aRun) ; ++k)
     { LevelRun *r = arrp(aRun, k, LevelRun) ;
       if (r->end <= start) continue ;
       if (r->start >= end) break ;
       U64 lo = r->start > start ? r->start : start, hi = r->end < end ? r->end : end ;
-      bits |= 1 << r->level ; covered += hi - lo ;
+      if (r->level < MAX_SCHEME) match->schemeLen[r->level] += hi - lo ; // a match never runs into a wall
+      covered += hi - lo ;
     }
-  if (covered < end - start) bits |= 1 ;
-  return bits ;
+  match->schemeLen[0] += (end - start) - covered ; // the rest is outside any run, so scanned with scheme 0
+  match->schemes = 0 ;
+  for (int s = 0 ; s < MAX_SCHEME ; ++s) if (match->schemeLen[s]) match->schemes |= 1 << s ;
 }
 
 // match is done and unlinked: keep it for reporting if it scores well enough, else free it
@@ -417,7 +426,7 @@ static void matchFinish (Worker *w, ScanParams *scan, Match *match, Query *q, Sc
   arrayDestroy (match->aNode) ; match->aNode = 0 ;
   if (isReport)
     { match->next = 0 ;
-      match->schemes = schemesUsed (w, match->query, match->start, match->bestEnd) ;
+      schemesUsed (w, match) ;
       array(w->aMatch, arrayMax(w->aMatch), Match*) = match ;
       ++st->nMatch ; st->matchLen += match->bestEnd - match->start ;
     }
@@ -460,19 +469,16 @@ static void removeSameEnd (Array aMatch, U64 i0, ScanStats *st)
 }
 
 
-static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
+// Scan target positions [from, to) for queries jLo..jHi-1, which must have no active matches. A match's
+// start and end windows must lie inside [from, to). Reported matches are added to w->aMatch.
+static void scanRange (ScanParams *scan, Worker *w, Job *job, int jLo, int jHi, U64 from, U64 to, ScanStats *st)
 {
   Array aQuery = scan->aQuery ;
-  int nQuery = arrayMax(aQuery), nScheme = scan->nScheme ;
-  memset (st, 0, sizeof(ScanStats)) ;
-  U64 i0 = arrayMax(w->aMatch) ; // this target's matches are added from here
-  double t0 = wallTime () ;
+  int nScheme = scan->nScheme ;
 
-  dangerLevels (scan, w, job->seq, job->len) ; // find where each query needs a stricter scheme
-
-  char *s = job->seq + 32 ;
-  for (U64 i = 32 ; i < job->len ; ++i, ++s)
-    { for (int j = 0 ; j < nQuery ; ++j)
+  char *s = job->seq + from + 32 ;
+  for (U64 i = from + 32 ; i < to ; ++i, ++s)
+    { for (int j = jLo ; j < jHi ; ++j)
 	{ Query *q  = arrp(aQuery, j, Query) ;
 	  char  *qs = q->seq ;
 	  int lv[65] ; // scheme levels at target positions i-32..i+32, so lv[32] is at i, unless uniform
@@ -489,7 +495,7 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	  // a start needs t[i-32..i-1] to score positively ungapped against q[0..31], and an end needs
 	  // t[i+1..i+32] against the end of the unit; each base is scored with the scheme at its position
 	  I64 newStart = 0, newEnd = 0 ; // the end window starts at t[i+1], after the cell for q[len-33] at t[i]
-	  bool isEndOK = i < job->len - 32 ;
+	  bool isEndOK = i + 32 < to ;
 	  if (isUniform)
 	    { for (int k = 0 ; k < 32 ; ++k) newStart += q->startScore[li][k][(int)s[k-32]] ;
 	      if (isEndOK) for (int k = 0 ; k < 32 ; ++k) newEnd += q->endScore[li][k][(int)s[k+1]] ;
@@ -616,7 +622,7 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	}
     }
 
-  for (int j = 0 ; j < nQuery ; ++j) // flush matches still active at end of sequence
+  for (int j = jLo ; j < jHi ; ++j) // flush matches still active at the end of the range
     { Query *q = arrp(aQuery, j, Query) ;
       Match *match = w->active[j], *next ;
       for ( ; match ; match = next)
@@ -625,14 +631,145 @@ static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
 	}
       w->active[j] = 0 ;
     }
+}
+
+static void excludeOverlaps (ScanParams *scan, Worker *w, Job *job, U64 i0, ScanStats *st) ;
+
+static void scanTarget (ScanParams *scan, Worker *w, Job *job, ScanStats *st)
+{
+  int nQuery = arrayMax(scan->aQuery) ;
+  memset (st, 0, sizeof(ScanStats)) ;
+  U64 i0 = arrayMax(w->aMatch) ; // this target's matches are added from here
+  double t0 = wallTime () ;
+
+  dangerLevels (scan, w, job->seq, job->len) ; // find where each query needs a stricter scheme
+  scanRange (scan, w, job, 0, nQuery, 0, job->len, st) ;
   removeSameEnd (w->aMatch, i0, st) ;
+  if (!scan->isAllowOverlaps) excludeOverlaps (scan, w, job, i0, st) ;
   st->seconds = wallTime () - t0 ;
+}
+
+/************ greedy exclusion of overlapping matches ************/
+
+// true if x is better than y: higher identity (exact match count over length), then longer, then the
+// smaller unit, then earlier in the library, then the forward strand, then the earlier start
+static bool isBetterMatch (ScanParams *scan, Match *x, Match *y)
+{
+  unsigned __int128 cx = x->bestScore & 0xffffffff, cy = y->bestScore & 0xffffffff ;
+  unsigned __int128 lx = x->bestEnd - x->start, ly = y->bestEnd - y->start ;
+  if (cx * ly != cy * lx) return cx * ly > cy * lx ;
+  if (lx != ly) return lx > ly ;
+  int ux = arrp(scan->aQuery, x->query, Query)->len, uy = arrp(scan->aQuery, y->query, Query)->len ;
+  if (ux != uy) return ux < uy ;
+  int ix = x->query % nQueryFwd, iy = y->query % nQueryFwd ;
+  if (ix != iy) return ix < iy ;
+  if (x->query != y->query) return x->query < y->query ; // forward queries come first
+  return x->start < y->start ;
+}
+
+// a binary heap of Match*, best at the top
+static void heapPush (ScanParams *scan, Array heap, Match *m)
+{
+  U64 i = arrayMax(heap) ;
+  array(heap, i, Match*) = m ;
+  Match **h = arrp(heap, 0, Match*) ;
+  while (i > 0 && isBetterMatch (scan, h[i], h[(i-1)/2]))
+    { Match *t = h[i] ; h[i] = h[(i-1)/2] ; h[(i-1)/2] = t ; i = (i-1)/2 ; }
+}
+
+static Match *heapPop (ScanParams *scan, Array heap)
+{
+  Match **h = arrp(heap, 0, Match*), *top = h[0] ;
+  U64 n = --arrayMax(heap), i = 0 ;
+  if (!n) return top ;
+  h[0] = h[n] ;
+  for (;;)
+    { U64 l = 2*i+1, r = l+1, b = i ;
+      if (l < n && isBetterMatch (scan, h[l], h[b])) b = l ;
+      if (r < n && isBetterMatch (scan, h[r], h[b])) b = r ;
+      if (b == i) break ;
+      Match *t = h[i] ; h[i] = h[b] ; h[b] = t ; i = b ;
+    }
+  return top ;
+}
+
+// make [start, end) a wall for query j, so no match of it can start in or run through there
+static void addWall (Worker *w, int j, U64 start, U64 end, int wallLevel)
+{
+  Array aRun = w->aRun[j], tmp = w->aRunTmp ;
+  arrayMax(tmp) = 0 ;
+  bool isAdded = false ;
+  LevelRun wall = { start, end, wallLevel } ;
+  for (U64 k = 0 ; k < arrayMax(aRun) ; ++k)
+    { LevelRun r = arr(aRun, k, LevelRun) ;
+      if (r.end <= start) { array(tmp, arrayMax(tmp), LevelRun) = r ; continue ; }
+      if (r.start >= end)
+	{ if (!isAdded) { array(tmp, arrayMax(tmp), LevelRun) = wall ; isAdded = true ; }
+	  array(tmp, arrayMax(tmp), LevelRun) = r ;
+	  continue ;
+	}
+      if (r.start < start) { LevelRun x = { r.start, start, r.level } ; array(tmp, arrayMax(tmp), LevelRun) = x ; }
+      if (!isAdded) { array(tmp, arrayMax(tmp), LevelRun) = wall ; isAdded = true ; }
+      if (r.end > end) { LevelRun x = { end, r.end, r.level } ; array(tmp, arrayMax(tmp), LevelRun) = x ; }
+    }
+  if (!isAdded) array(tmp, arrayMax(tmp), LevelRun) = wall ;
+  arrayMax(aRun) = 0 ; // copy back, merging touching runs of the same level
+  for (U64 k = 0 ; k < arrayMax(tmp) ; ++k)
+    { LevelRun *r = arrp(tmp, k, LevelRun) ;
+      LevelRun *last = arrayMax(aRun) ? arrp(aRun, arrayMax(aRun)-1, LevelRun) : 0 ;
+      if (last && last->end == r->start && last->level == r->level) last->end = r->end ;
+      else array(aRun, arrayMax(aRun), LevelRun) = *r ;
+    }
+  w->runCursor[j] = 0 ;
+}
+
+static void matchFree (Match *m) { newFree (m->parse, m->nParse ? m->nParse : 1, U32) ; newFree (m, 1, Match) ; }
+
+// Greedy exclusion over this target's matches, w->aMatch[i0...], of all queries and both strands:
+// take matches best first; accept one if it overlaps no accepted match, else drop it, wall off the
+// accepted matches it overlaps for its query, and rescan its span for that query, so the parts of its
+// array outside the better matches are found again; those go back into the queue. Walls only grow,
+// so this ends. Afterwards no two matches of the target overlap.
+static void excludeOverlaps (ScanParams *scan, Worker *w, Job *job, U64 i0, ScanStats *st)
+{
+  Array heap = arrayCreate (arrayMax(w->aMatch) - i0 + 16, Match*) ;
+  Array acc = arrayCreate (arrayMax(w->aMatch) - i0 + 16, Match*) ; // accepted, sorted by start, disjoint
+  for (U64 i = i0 ; i < arrayMax(w->aMatch) ; ++i) heapPush (scan, heap, arr(w->aMatch, i, Match*)) ;
+  arrayMax(w->aMatch) = i0 ; // rescans add their matches here, and they are moved into the heap
+  while (arrayMax(heap))
+    { Match *m = heapPop (scan, heap) ;
+      U64 n = arrayMax(acc), lo = 0, hi = n ;	// first accepted match ending after m starts
+      Match **a = n ? arrp(acc, 0, Match*) : 0 ;
+      while (lo < hi) { U64 mid = (lo + hi) / 2 ; if (a[mid]->bestEnd <= m->start) lo = mid + 1 ; else hi = mid ; }
+      if (lo == n || a[lo]->start >= m->bestEnd) // no overlap: accept it, keeping acc sorted
+	{ array(acc, n, Match*) = 0 ; a = arrp(acc, 0, Match*) ;
+	  memmove (a + lo + 1, a + lo, (n - lo) * sizeof(Match*)) ;
+	  a[lo] = m ;
+	  continue ;
+	}
+      ++st->nExcluded ; ++w->nExcludedQuery[m->query] ;
+      for (U64 k = lo ; k < n && a[k]->start < m->bestEnd ; ++k)
+	addWall (w, m->query, a[k]->start, a[k]->bestEnd, scan->nScheme) ;
+      U64 from = m->start, to = m->bestEnd ;
+      int j = m->query ;
+      matchFree (m) ;
+      scanRange (scan, w, job, j, j+1, from, to, st) ;
+      for (U64 i = i0 ; i < arrayMax(w->aMatch) ; ++i) { heapPush (scan, heap, arr(w->aMatch, i, Match*)) ; ++st->nRescanned ; }
+      arrayMax(w->aMatch) = i0 ;
+    }
+  st->nMatch = arrayMax(acc) ; st->matchLen = 0 ;
+  for (U64 k = 0 ; k < arrayMax(acc) ; ++k)
+    { Match *m = arr(acc, k, Match*) ;
+      array(w->aMatch, arrayMax(w->aMatch), Match*) = m ;
+      st->matchLen += m->bestEnd - m->start ;
+    }
+  arrayDestroy (heap) ; arrayDestroy (acc) ;
 }
 
 static void reportTarget (Job *job, ScanStats *st)
 {
-  fprintf (stderr, "%s length %llu: %llu starts, %llu matches, total match length %llu, %.2f s\n",
-	   job->name, job->len, st->nStart, st->nMatch, st->matchLen, st->seconds) ;
+  fprintf (stderr, "%s length %llu: %llu starts, %llu matches, total match length %llu, %llu excluded as overlapping, %.2f s\n",
+	   job->name, job->len, st->nStart, st->nMatch, st->matchLen, st->nExcluded, st->seconds) ;
 }
 
 // scan one target, report it to stderr, update the worker's totals and release the job's sequence
@@ -642,6 +779,7 @@ static void workerRun (ScanParams *scan, Worker *w, Job *job)
   scanTarget (scan, w, job, &st) ;
   reportTarget (job, &st) ;
   w->totStart += st.nStart ; w->totMatch += st.nMatch ; w->totMatchLen += st.matchLen ; w->totSameEnd += st.nSameEnd ;
+  w->totExcluded += st.nExcluded ; w->totRescanned += st.nRescanned ;
   if (job->ownsSeq) newFree (job->seq, job->len, char) ;
 }
 
@@ -715,7 +853,6 @@ static void *workerMain (void *arg)
   return 0 ;
 }
 
-static int nQueryFwd ; // number of forward queries, for matchOrder()
 
 // sorts by target in file order, then start position, then query with each forward query before its reverse complement
 static int matchOrder (const void *a, const void *b)
@@ -804,6 +941,8 @@ int main (int argc, char *argv[])
     "    -smin <n>          minimum score to report [50]\n"
     "    -xmin <n>          minimum x-drop: a match drops cells more than the x-drop below its best [200]\n"
     "    -xfac <x>          x-drop is the larger of xmin and xfac times the unit length [2.0]\n"
+    "    -allowOverlaps     keep matches that overlap [by default only the best of overlapping matches is\n"
+    "                       kept, and the others are rescanned around it]\n"
     "    -T <n>             number of scanning threads [8]\n" ;
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
@@ -811,6 +950,7 @@ int main (int argc, char *argv[])
   char *repFileName = 0 ;   // with none of these, writeRep() writes ascii match lines to stdout
   ScoreParams userScheme ;
   bool isUserScheme = false ;
+  bool isAllowOverlaps = false ;
   U64 scoreMin = 50 ;
   int xMin = 200 ;
   double xFac = 2.0 ;
@@ -846,6 +986,8 @@ int main (int argc, char *argv[])
           isUserScheme = true ;
           argc-- ;
         }
+      else if (!strcmp (*argv, "-allowOverlaps"))
+        isAllowOverlaps = true ;
       else if (!strcmp (*argv, "-T") && argc > 1)
         { nThread = atoi (*++argv) ;
           if (nThread < 1) die ("bad number of threads %s - must be at least 1\n%s", *argv, usage) ;
@@ -874,6 +1016,7 @@ int main (int argc, char *argv[])
 
   ScanParams scan ;
   scan.nScheme = isUserScheme ? 1 : MAX_SCHEME ;
+  scan.isAllowOverlaps = isAllowOverlaps ;
   for (int k = 0 ; k < scan.nScheme ; ++k)
     { ScoreParams *sp = &scan.sp[k] ;
       *sp = isUserScheme ? userScheme : defaultScheme[k] ;
@@ -1003,11 +1146,12 @@ int main (int argc, char *argv[])
     }
 
   // gather the matches from all the workers into the first worker's array, then sort and write
-  U64 totStart = 0, totMatch = 0, totMatchLen = 0, totSameEnd = 0 ;
+  U64 totStart = 0, totMatch = 0, totMatchLen = 0, totSameEnd = 0, totExcluded = 0, totRescanned = 0 ;
   Array aMatch = worker[0]->aMatch ;
   for (int t = 0 ; t < nThread ; ++t)
     { Worker *w = worker[t] ;
       totStart += w->totStart ; totMatch += w->totMatch ; totMatchLen += w->totMatchLen ; totSameEnd += w->totSameEnd ;
+      totExcluded += w->totExcluded ; totRescanned += w->totRescanned ;
       if (t)
 	for (U64 i = 0 ; i < arrayMax(w->aMatch) ; ++i)
 	  array(aMatch, arrayMax(aMatch), Match*) = arr(w->aMatch, i, Match*) ;
@@ -1042,8 +1186,14 @@ int main (int argc, char *argv[])
     }
   else if (!repFileName)
     writeRep ("-", schema, 0, queryFileName, aQuery, aMatch) ;
+  // per unit, both strands together: matches, bases, exact matches, and bases scanned with each scheme
+  U64 *uMatch = new0 (nQueryFwd, U64), *uLen = new0 (nQueryFwd, U64), *uCount = new0 (nQueryFwd, U64) ;
+  U64 *uScheme = new0 (nQueryFwd*MAX_SCHEME, U64) ;
   for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i) // whichever outputs were written
     { Match *m = arr(aMatch, i, Match*) ;
+      int u = m->query % nQueryFwd ;
+      ++uMatch[u] ; uLen[u] += m->bestEnd - m->start ; uCount[u] += m->bestScore & 0xffffffff ;
+      for (int k = 0 ; k < MAX_SCHEME ; ++k) uScheme[u*MAX_SCHEME+k] += m->schemeLen[k] ;
       newFree (m->parse, m->nParse ? m->nParse : 1, U32) ;
       newFree (m, 1, Match) ;
     }
@@ -1052,19 +1202,23 @@ int main (int argc, char *argv[])
   fprintf (stderr, "found %llu starts, %llu matches, total match length %llu bp\n",
 	   totStart, totMatch, totMatchLen) ;
   if (totSameEnd) fprintf (stderr, "(after removing %llu matches ending where a better one of the same query ends)\n", totSameEnd) ;
-  if (scan.nScheme > 1) // regions scanned with a stricter scheme, or walled, for each query strand
-    for (int j = 0 ; j < arrayMax(aQuery) ; ++j)
-      { U64 n[MAX_SCHEME+1], len[MAX_SCHEME+1] ;
-	for (int k = 0 ; k <= MAX_SCHEME ; ++k)
-	  { n[k] = len[k] = 0 ;
-	    for (int t = 0 ; t < nThread ; ++t)
-	      { n[k] += worker[t]->regionN[j*(MAX_SCHEME+1)+k] ; len[k] += worker[t]->regionLen[j*(MAX_SCHEME+1)+k] ; }
-	  }
-	if (!n[1] && !n[2] && !n[3]) continue ;
-	Query *q = arrp(aQuery, j, Query) ;
-	fprintf (stderr, "%s %c: medium %llu regions %llu bp, strong %llu regions %llu bp, walled %llu regions %llu bp\n",
-		 q->name, q->isRC ? '-' : '+', n[1], len[1], n[2], len[2], n[3], len[3]) ;
-      }
+  if (totExcluded)
+    fprintf (stderr, "(after excluding %llu matches that overlapped a better one, rescanning whose spans found %llu)\n",
+	     totExcluded, totRescanned) ;
+  for (int u = 0 ; u < nQueryFwd ; ++u) // one line per unit, in the order of the unit file
+    { U64 nExcluded = 0 ;
+      for (int t = 0 ; t < nThread ; ++t)
+	nExcluded += worker[t]->nExcludedQuery[u] + worker[t]->nExcludedQuery[u+nQueryFwd] ;
+      fprintf (stderr, "%s: %llu matches, %llu bp, identity %.1f%%, %llu excluded as overlapping",
+	       arrp(aQuery, u, Query)->name, uMatch[u], uLen[u], uLen[u] ? 100.0 * uCount[u] / uLen[u] : 0.0, nExcluded) ;
+      if (scan.nScheme > 1 && uLen[u])
+	fprintf (stderr, ", bases scanned weak %.1f%% medium %.1f%% strong %.1f%%",
+		 100.0 * uScheme[u*MAX_SCHEME] / uLen[u], 100.0 * uScheme[u*MAX_SCHEME+1] / uLen[u],
+		 100.0 * uScheme[u*MAX_SCHEME+2] / uLen[u]) ;
+      fputc ('\n', stderr) ;
+    }
+  newFree (uMatch, nQueryFwd, U64) ; newFree (uLen, nQueryFwd, U64) ; newFree (uCount, nQueryFwd, U64) ;
+  newFree (uScheme, nQueryFwd*MAX_SCHEME, U64) ;
   timeTotal(stderr) ;
 
   if (tsvFile) fclose (tsvFile) ;

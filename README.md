@@ -111,14 +111,16 @@ By default satscan uses a hierarchical scoring scheme, to avoid false positives 
 ```
 > satscan -tsv mHomSap-cen.tsv -bed mHomSap-cen.bed mHomSap-cen.fa mHomSap.fa.gz
 read in 1 query sequences, total length 171 bp
-chr3 length 201105948: 199177 starts, 32 matches, total match length 2642064, 8.85 s
-chr2 length 242696752: 240625 starts, 15 matches, total match length 2496674, 9.93 s
-chr4 length 193574945: 204646 starts, 14 matches, total match length 3836542, 9.31 s
+chr3 length 201105948: 199178 starts, 32 matches, total match length 2641895, 1 excluded as overlapping, 8.38 s
+chr2 length 242696752: 240625 starts, 15 matches, total match length 2496674, 0 excluded as overlapping, 9.19 s
+chr4 length 193574945: 204646 starts, 14 matches, total match length 3836542, 0 excluded as overlapping, 8.59 s
 ...
 processed 25 target sequences, total length 3117292070 bp
-found 3022340 starts, 1150 matches, total match length 83414300 bp
+found 3022409 starts, 1151 matches, total match length 83400667 bp
 (after removing 4 matches ending where a better one of the same query ends)
-user	179.175281	system	0.623519	elapsed 26.071777	alloc_max 3206 MB	max_RSS	3444883456
+(after excluding 64 matches that overlapped a better one, rescanning whose spans found 65)
+cen-171: 1151 matches, 83400667 bp, identity 83.7%, 64 excluded as overlapping, bases scanned weak 100.0% medium 0.0% strong 0.0%
+user	168.814748	system	0.632454	elapsed 24.490521	alloc_max 3206 MB	max_RSS	3445374976
 > head -3 mHomSap-cen.tsv
 chr1	103897763	103911559	cen-171	7788	9679	+	171,341,512,684,...	w
 chr1	121619161	121788063	cen-171	191729	136828	-	167,336,504,674,...	w
@@ -129,13 +131,13 @@ chr1	121619161	121788063	cen-171	810	-
 chr1	121790397	121795996	cen-171	823	-
 ```
 
-The progress lines are written to stderr, one for each target sequence as its scan finishes (so not necessarily in file order), giving the number of start windows found, the number of matches reported, their total length, and the wall time for that sequence.  The results are collected, sorted by target in file order and then by start, and written at the end.  For each unit and strand that needed a stricter scheme somewhere, stderr also reports the number and total length of the regions scanned with the medium and strong schemes, and of the regions where no match was allowed; there are none for the alpha satellite unit above.
+The progress lines are written to stderr, one for each target sequence as its scan finishes (so not necessarily in file order), giving the number of start windows found, the number of matches reported, their total length, the number of matches excluded because they overlapped a better one, and the wall time for that sequence.  The results are collected, sorted by target in file order and then by start, and written at the end.  At the end there is a line for each unit, in the order of the unit file and with both strands together, giving its number of matches, their total length, their mean identity (exact matches over total length), the number of its matches excluded because they overlapped a better one, and, with the hierarchical scoring, the fraction of its matched bases scanned with each of the weak, medium and strong schemes.
 
 There are three output formats, which can be used together: `-1 <file>` writes a binary ONEcode `.1rep` file, described below, `-tsv <file>` writes tab-separated text, and `-bed <file>` writes BED.  If none of them is given, the match lines of the `.1rep` format are written to standard output in ascii, without the header, genome skeleton or library that would make them self-contained.  That is handy for a quick look, but for results to keep use `-1`, `-tsv` or `-bed`.
 
 Each line of the `-tsv` output has nine tab-separated columns: the target name, the start (0-based) and end (exclusive) of the match in the target, the name of the unit sequence, the alignment score, the number of exact base matches in the alignment, the strand, which is `-` if the reverse complement of the unit matched, the parse of the match into copies of the unit, and the scoring schemes used for the match, as some of `w`, `m` and `s` for weak, medium and strong, or `u` if `-score` was given.  The parse is a comma-separated list of the internal copy boundaries, i.e. the start of each copy after the first, relative to the start of the match, or `.` if the match is a single copy; the lists are truncated with `...` in the example above.  A copy begins where the alignment reaches the start of the unit, so its boundaries depend on the rotation of the unit sequence.  The parse uses the same convention as the `P` lines that FasTAN writes in `.1ano` files.
 
-Percent identity can be calculated as 100 * (exact matches) / (end - start).  This measures exact matches against the span of the target, so bases of the unit that are skipped by a gap do not add to the denominator.  Matches from different units, or from the two strands of one unit, can overlap, but if two matches of the same unit on the same strand end at the same place then only the better one is kept, and the number removed is reported on stderr.
+Percent identity can be calculated as 100 * (exact matches) / (end - start).  This measures exact matches against the span of the target, so bases of the unit that are skipped by a gap do not add to the denominator.  By default no two reported matches overlap, whatever their units or strands.  Overlaps are resolved greedily for each target sequence: matches are taken in order of identity (exact matches over length), then length, then shorter unit, then position in the unit file, and each is kept if it overlaps no match kept already.  A match that overlaps a better one is dropped, but its span is rescanned for its unit and strand with the better matches walled off, so that the parts of its array outside them are found again, and any matches found are themselves resolved in the same way.  So a short, highly similar array of one unit inside a longer, less similar array of another splits the longer one in two.  The numbers of matches excluded, and found by rescanning, are reported on stderr.  `-allowOverlaps` keeps all the matches instead, so that matches from different units, or from the two strands of one unit, can overlap; even then, if two matches of the same unit on the same strand end at the same place, only the better one is kept.
 
 With `-bed <file>` a standard [BED](https://en.wikipedia.org/wiki/BED_(file_format)) file with six columns is written: the target, start, end, unit name, the identity in parts per thousand, `(int)(1000*matches/(end-start))`, in the score column, and the strand.
 
@@ -146,7 +148,7 @@ With `-1 <file>` satscan writes a binary [ONEcode](https://github.com/thegenemye
 > ONEview dmel-sat.1rep
 1 3 ano 2 1
 2 3 rep
-! 4 7 satscan 3 0.1 73 satscan -1 dmel-sat.1rep dmel-sat.fa dmel.fa.gz 19 2026-10-20_02:48:31
+! 4 7 satscan 3 0.1 73 satscan -1 dmel-sat.1rep dmel-sat.fa dmel.fa.gz 19 2026-10-20_23:56:42
 < 11 dmel-sat.fa 2
 < 10 dmel.fa.gz 1
 ...
@@ -190,6 +192,7 @@ Options are:
 | `-smin <n>` | minimum score to report a match (default 50) |
 | `-xmin <n>` | minimum x-drop (default 200) |
 | `-xfac <x>` | the x-drop is the larger of `-xmin` and this times the unit length (default 2.0) |
+| `-allowOverlaps` | keep overlapping matches, rather than only the best of them |
 | `-T <n>` | number of scanning threads (default 8) |
 
 ## gdbmask
