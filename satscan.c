@@ -5,12 +5,13 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 20 23:59 2026 (claude)
+ * Last edited: Oct 21 13:30 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
 
 #include "onerep.h"
+#include "alntools.h"
 #include "array.h"  // contains utils.h
 #include "seqio.h"
 #include "ONElib.h"
@@ -83,6 +84,7 @@ typedef struct {
   int   isRC ;
   int   index ;     // 1-based position of the entry in the query file, counting any that were skipped
   char *name ;      // shared between a forward query and its reverse complement
+  char *type ;      // the Y type from a .1lib file, or 0 meaning "tandem"; shared like name
   char *seq ;
   I64   startScore[MAX_SCHEME][32][4] ;
   I64   endScore[MAX_SCHEME][32][4] ;
@@ -109,6 +111,7 @@ void queryDestroy (Array a)
     { Query *q = arrp(a,i,Query) ;
       newFree (q->seq, q->len, char) ;
       if (!q->isRC) newFree (q->name, strlen(q->name)+1, char) ;
+      if (!q->isRC && q->type) newFree (q->type, strlen(q->type)+1, char) ;
     }
   arrayDestroy (a) ;
 }
@@ -724,6 +727,60 @@ static int matchOrder (const void *a, const void *b)
   return 0 ;
 }
 
+// Write the matches as a binary .1rep file: the genome skeleton, a free-standing library block with an
+// I object for each forward query, then one M object per match, in the same order as the text output.
+// T's library index is the 1-based index of the query's I object, the same for both strands.
+static void writeRep (char *fileName, OneSchema *schema, Gdb *gdb, char *queryFileName,
+		      Array aQuery, Array aMatch)
+{
+  bool isBinary = strcmp (fileName, "-") ;
+  
+  OneFile *of = oneFileOpenWriteNew (fileName, schema, "rep", isBinary, 1) ;
+  if (!of) die ("failed to open .1rep file %s", fileName) ;
+  if (!isBinary) of->isNoAsciiHeader = true ; // to stdout: just the match lines
+
+  if (isBinary)
+    { // write header information
+      oneAddProvenance (of, "satscan", VERSION, getCommandLine()) ;
+      oneAddReference (of, queryFileName, 2) ;
+      // write the Gdb = genome skeleton
+      writeGdb (of, gdb, 1, 0) ; // also adds the genome file as reference 1
+      // write the library
+      oneWriteLine (of, 'l', 0, 0) ;
+      for (int j = 0 ; j < nQueryFwd ; ++j)
+	{ Query *q = arrp(aQuery, j, Query) ;
+	  char *type = q->type ? q->type : "tandem" ;
+	  oneInt(of,1) = q->len ;
+	  oneWriteLine (of, 'I', strlen(q->name), q->name) ;
+	  oneWriteLine (of, 'Y', strlen(type), type) ;
+	}
+    }
+  
+  // write the matches
+  I64 *parse = 0 ; int maxParse = 0 ;
+  for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
+    { Match *m = arr(aMatch, i, Match*) ;
+      Query *q = arrp(aQuery, m->query, Query) ;
+      oneInt(of,0) = m->target ; oneInt(of,1) = m->start ; oneInt(of,2) = m->bestEnd ;
+      oneWriteLine (of, 'M', 0, 0) ;
+      oneInt(of,0) = (1000 * (m->bestScore & 0xffffffff)) / (m->bestEnd - m->start) ;
+      oneWriteLine (of, 'B', 0, 0) ;
+      oneInt(of,0) = q->len ; oneInt(of,1) = m->query % nQueryFwd + 1 ;
+      oneWriteLine (of, 'T', 0, 0) ;
+      if (q->isRC) oneWriteLine (of, 'R', 0, 0) ;
+      if (m->nParse)
+	{ if (m->nParse > maxParse)
+	    { if (parse) newFree (parse, maxParse, I64) ;
+	      maxParse = m->nParse ; parse = new (maxParse, I64) ;
+	    }
+	  for (int k = 0 ; k < m->nParse ; ++k) parse[k] = m->parse[k] ;
+	  oneWriteLine (of, 'P', m->nParse, parse) ;
+	}
+    }
+  if (parse) newFree (parse, maxParse, I64) ;
+  oneFileClose (of) ; // writes the footer, without which the file can't be read
+}
+
 int main (int argc, char *argv[])
 {
   timeUpdate (0) ;
@@ -734,8 +791,11 @@ int main (int argc, char *argv[])
     "  Finds tandem matches of complete units with affine gap alignment. By default uses a hierarchical\n"
     "  scoring scheme to avoid composition-based false positives. A user-provided scoring scheme overrides this.\n"
     "  options are:\n"
-    "    -o <file_name>     output file [standard output, unless -bed is given]\n"
+    "    -1 <file_name>     write a binary ONEcode .1rep file of the matches\n"
+    "    -tsv <file_name>   write tab-separated text: target, start, end, query, score, exact matches,\n"
+    "                       strand, parse into copies, schemes used\n"
     "    -bed <file_name>   write BED6 to this file: target, start, end, query, per-mil identity, strand\n"
+    "                       [with none of -1, -tsv or -bed, the match lines of a .1rep go to standard output]\n"
     "    -score <m>,<ti>,<tv>,<go>,<ge>  match, transition, transversion, gap open and gap extend scores,\n"
     "                       used everywhere, e.g. -score 1,-1,-2,-7,-1 [by default weak 2,-1,-3,-15,-1,\n"
     "                       medium 2,-2,-4,-20,-2 or strong 2,-3,-6,-25,-2, chosen by region composition]\n"
@@ -745,7 +805,8 @@ int main (int argc, char *argv[])
     "    -T <n>             number of scanning threads [8]\n" ;
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
-  FILE *outFile = 0, *bedFile = 0 ;	// outFile defaults to stdout unless -bed is given
+  FILE *tsvFile = 0, *bedFile = 0 ;
+  char *repFileName = 0 ;   // with none of these, writeRep() writes ascii match lines to stdout
   ScoreParams userScheme ;
   bool isUserScheme = false ;
   U64 scoreMin = 50 ;
@@ -755,9 +816,9 @@ int main (int argc, char *argv[])
 
   /* Process command line options */
   while (argc > 1 && **argv == '-')
-    { if (!strcmp (*argv, "-o"))
-        { if (!(outFile = fopen (*++argv, "w")))
-            { fprintf (stderr, "failed to open output file %s\n", *argv) ;
+    { if (!strcmp (*argv, "-tsv") && argc > 1)
+        { if (!(tsvFile = fopen (*++argv, "w")))
+            { fprintf (stderr, "failed to open tsv file %s\n", *argv) ;
               exit (1) ;
             }
           argc-- ;
@@ -769,6 +830,8 @@ int main (int argc, char *argv[])
             }
           argc-- ;
         }
+      else if (!strcmp (*argv, "-1") && argc > 1)
+        { repFileName = *++argv ; argc-- ; }
       else if (!strcmp (*argv, "-score") && argc > 1)
         { int m, ti, tv, go, ge ; char extra ;
           if (sscanf (*++argv, "%d,%d,%d,%d,%d%c", &m, &ti, &tv, &go, &ge, &extra) != 5)
@@ -806,7 +869,6 @@ int main (int argc, char *argv[])
       argc-- ; argv++ ;
     }
   if (argc != 2) die (usage) ;
-  if (!outFile && !bedFile) outFile = stdout ;
 
   ScanParams scan ;
   scan.nScheme = isUserScheme ? 1 : MAX_SCHEME ;
@@ -836,8 +898,10 @@ int main (int argc, char *argv[])
 	  while (oneReadLine (of) && of->lineType != 'S')
 	    if (of->lineType == 'I' && !q->name)
 	      { q->name = new (oneLen(of)+1, char) ; strcpy (q->name, oneString(of)) ; }
-	    else if (of->lineType == 'Y' && strncmp (oneString(of), "tandem", 6))
-	      isTandem = false ;
+	    else if (of->lineType == 'Y' && !q->type)
+	      { if (strncmp (oneString(of), "tandem", 6)) isTandem = false ;
+		q->type = new (oneLen(of)+1, char) ; strcpy (q->type, oneString(of)) ;
+	      }
 	  if (isTandem)
 	    { if (!q->name)
 		{ char buf[32] ; sprintf (buf, "tandem-%d", nEntry) ;
@@ -847,6 +911,7 @@ int main (int argc, char *argv[])
 	  else
 	    { ++nSkip ; newFree (q->seq, q->len, char) ;
 	      if (q->name) { newFree (q->name, strlen(q->name)+1, char) ; q->name = 0 ; }
+	      if (q->type) { newFree (q->type, strlen(q->type)+1, char) ; q->type = 0 ; }
 	      --arrayMax(aQuery) ; // fail to register this entry
 	    }
 	}
@@ -876,13 +941,15 @@ int main (int argc, char *argv[])
       q->xDrop = qr->xDrop = (x > xMin ? x : xMin) * ONE ;
       totSat += q->len ;
     }
+  char *queryFileName = *argv ;
   --argc ; ++argv ;
   fprintf (stderr, "read in %d query sequences, total length %llu bp", nQuery, totSat) ;
   if (nSkip) fprintf (stderr, ", skipping %d whose type is not tandem", nSkip) ;
   fprintf (stderr, "\n") ;
 
   SeqIO *sio ;
-  sio = seqIOopenRead (*argv, dna2index4Conv, "r") ;
+  char *targetFileName = *argv ;
+  sio = seqIOopenRead (targetFileName, 0, false) ; // as text, for the Gdb; converted below for scanning
   if (!sio) die ("failed to open target sequence file %s", *argv) ;
   scan.aQuery = aQuery ; scan.scoreMin = scoreMin ;
   Worker **worker = new0 (nThread, Worker*) ;
@@ -902,14 +969,18 @@ int main (int argc, char *argv[])
     }
 
   U64 nSeq = 0, totSeq = 0 ;
+  GdbBuilder *gb = repFileName ? gdbBuilderCreate (targetFileName) : 0 ;
   while (seqIOread (sio))
-    { ++nSeq ; totSeq += sio->seqLen ;
-      if (sio->seqLen < 32) continue ;
-      Job job ;
-      job.target = arrayMax(aTargetName) ;
+    { Job job ;
+      job.target = nSeq++ ; totSeq += sio->seqLen ; // every sequence is numbered, as in the Gdb
       job.name = new (strlen(sqioId(sio))+1, char) ; strcpy (job.name, sqioId(sio)) ;
       array(aTargetName, job.target, char*) = job.name ;
       job.len = sio->seqLen ;
+      char *seq = sqioSeq(sio) ;
+      if (gb) gdbAddSequence (gb, job.name, seq, job.len) ;
+      if (job.len < 32) continue ;
+      for (U64 i = 0 ; i < job.len ; ++i) // to 0..3, with N and anything else as 0, i.e. A
+	{ int c = (U8)seq[i], a = c < 128 ? dna2index4Conv[c] : 0 ; seq[i] = a < 0 ? 0 : a ; }
       if (nThread == 1)
 	{ job.seq = sqioSeq(sio) ; job.ownsSeq = false ;
 	  workerRun (&scan, worker[0], &job) ;
@@ -940,25 +1011,37 @@ int main (int argc, char *argv[])
 	  array(aMatch, arrayMax(aMatch), Match*) = arr(w->aMatch, i, Match*) ;
     }
   arraySort (aMatch, matchOrder) ;
-  for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
-    { Match *m = arr(aMatch, i, Match*) ;
-      char *tName = arr(aTargetName, m->target, char*) ;
-      Query *q    = arrp(aQuery, m->query, Query) ;
-      char  *qName = q->name ;
-      U64    count = m->bestScore & 0xffffffff ;
-      char   strand = q->isRC ? '-' : '+' ;
-      if (outFile)
-	{ fprintf (outFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\t%c\t", tName, m->start, m->bestEnd, qName,
-		   (U64)(m->bestScore >> 32), count, strand) ;
-	  if (!m->nParse) fputc ('.', outFile) ; // just one copy
-	  for (int k = 0 ; k < m->nParse ; ++k) fprintf (outFile, k ? ",%u" : "%u", m->parse[k]) ;
-	  fputc ('\t', outFile) ; // the scheme(s) used
-	  for (int k = 0 ; k < scan.nScheme ; ++k) if (m->schemes & (1 << k)) fputc (schemeChar[k], outFile) ;
-	  fputc ('\n', outFile) ;
+  if (repFileName)
+    { Gdb *gdb = gdbFromBuilder (gb) ;
+      writeRep (repFileName, schema, gdb, queryFileName, aQuery, aMatch) ;
+      gdbDestroy (gdb) ;
+    }
+  if (tsvFile || bedFile)
+    { for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
+	{ Match *m = arr(aMatch, i, Match*) ;
+	  char *tName = arr(aTargetName, m->target, char*) ;
+	  Query *q    = arrp(aQuery, m->query, Query) ;
+	  char  *qName = q->name ;
+	  U64    count = m->bestScore & 0xffffffff ;
+	  char   strand = q->isRC ? '-' : '+' ;
+	  if (tsvFile)
+	    { fprintf (tsvFile, "%s\t%llu\t%llu\t%s\t%llu\t%llu\t%c\t", tName, m->start, m->bestEnd, qName,
+		       (U64)(m->bestScore >> 32), count, strand) ;
+	      if (!m->nParse) fputc ('.', tsvFile) ; // just one copy
+	      for (int k = 0 ; k < m->nParse ; ++k) fprintf (tsvFile, k ? ",%u" : "%u", m->parse[k]) ;
+	      fputc ('\t', tsvFile) ; // the scheme(s) used
+	      for (int k = 0 ; k < scan.nScheme ; ++k) if (m->schemes & (1 << k)) fputc (schemeChar[k], tsvFile) ;
+	      fputc ('\n', tsvFile) ;
+	    }
+	  if (bedFile)
+	    fprintf (bedFile, "%s\t%llu\t%llu\t%s\t%d\t%c\n", tName, m->start, m->bestEnd, qName,
+		     (int)(1000 * count / (m->bestEnd - m->start)), strand) ;
 	}
-      if (bedFile)
-	fprintf (bedFile, "%s\t%llu\t%llu\t%s\t%d\t%c\n", tName, m->start, m->bestEnd, qName,
-		 (int)(1000 * count / (m->bestEnd - m->start)), strand) ;
+    }
+  else if (!repFileName)
+    writeRep ("-", schema, 0, queryFileName, aQuery, aMatch) ;
+  for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i) // whichever outputs were written
+    { Match *m = arr(aMatch, i, Match*) ;
       newFree (m->parse, m->nParse ? m->nParse : 1, U32) ;
       newFree (m, 1, Match) ;
     }
@@ -982,7 +1065,7 @@ int main (int argc, char *argv[])
       }
   timeTotal(stderr) ;
 
-  if (outFile && outFile != stdout) fclose (outFile) ;
+  if (tsvFile) fclose (tsvFile) ;
   if (bedFile) fclose (bedFile) ;
   for (U64 i = 0 ; i < arrayMax(aTargetName) ; ++i)
     { char *name = arr(aTargetName, i, char*) ; newFree (name, strlen(name)+1, char) ; }

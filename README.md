@@ -101,7 +101,7 @@ A match starts where 32bp of the target scores positively, with no gaps, against
 By default satscan uses a hierarchical scoring scheme, to avoid false positives in regions whose base composition happens to suit a unit, for example purine-rich sequence for a purine-rich unit.  There are three schemes of increasing strictness, all with a match score of +2: weak (2,-1,-3,-15,-1), medium (2,-2,-4,-20,-2) and strong (2,-3,-6,-25,-2), giving the match, transition, transversion, gap open and gap extend scores.  For each unit and strand, and each target sequence, satscan finds the regions where the expected score of the unit against random sequence of the region's composition is above -1 per base for the weak scheme, and scans those regions with the medium scheme; within those it finds where medium is also unsafe and uses the strong scheme, and where even strong is unsafe no match may start or continue.  Elsewhere the weak scheme is used.  The rationale, the method and the simulations behind the choice of schemes and threshold are described in [satscan-scoring.md](satscan-scoring.md).  Giving `-score` instead applies a single scheme everywhere, with no masking.  Example usage is, for the human genome and the 171bp centromeric alpha satellite unit:
 
 ```
-> satscan -o mHomSap-cen.tsv -bed mHomSap-cen.bed mHomSap-cen.fa mHomSap.fa.gz
+> satscan -tsv mHomSap-cen.tsv -bed mHomSap-cen.bed mHomSap-cen.fa mHomSap.fa.gz
 read in 1 query sequences, total length 171 bp
 chr3 length 201105948: 199177 starts, 32 matches, total match length 2642064, 8.85 s
 chr2 length 242696752: 240625 starts, 15 matches, total match length 2496674, 9.93 s
@@ -123,11 +123,51 @@ chr1	121790397	121795996	cen-171	823	-
 
 The progress lines are written to stderr, one for each target sequence as its scan finishes (so not necessarily in file order), giving the number of start windows found, the number of matches reported, their total length, and the wall time for that sequence.  The results are collected, sorted by target in file order and then by start, and written at the end.  For each unit and strand that needed a stricter scheme somewhere, stderr also reports the number and total length of the regions scanned with the medium and strong schemes, and of the regions where no match was allowed; there are none for the alpha satellite unit above.
 
-Each line of the main output has nine tab-separated columns: the target name, the start (0-based) and end (exclusive) of the match in the target, the name of the unit sequence, the alignment score, the number of exact base matches in the alignment, the strand, which is `-` if the reverse complement of the unit matched, the parse of the match into copies of the unit, and the scoring schemes used for the match, as some of `w`, `m` and `s` for weak, medium and strong, or `u` if `-score` was given.  The parse is a comma-separated list of the internal copy boundaries, i.e. the start of each copy after the first, relative to the start of the match, or `.` if the match is a single copy; the lists are truncated with `...` in the example above.  A copy begins where the alignment reaches the start of the unit, so its boundaries depend on the rotation of the unit sequence.  The parse uses the same convention as the `P` lines that FasTAN writes in `.1ano` files.
+There are three output formats, which can be used together: `-1 <file>` writes a binary ONEcode `.1rep` file, described below, `-tsv <file>` writes tab-separated text, and `-bed <file>` writes BED.  If none of them is given, the match lines of the `.1rep` format are written to standard output in ascii, without the header, genome skeleton or library that would make them self-contained.  That is handy for a quick look, but for results to keep use `-1`, `-tsv` or `-bed`.
+
+Each line of the `-tsv` output has nine tab-separated columns: the target name, the start (0-based) and end (exclusive) of the match in the target, the name of the unit sequence, the alignment score, the number of exact base matches in the alignment, the strand, which is `-` if the reverse complement of the unit matched, the parse of the match into copies of the unit, and the scoring schemes used for the match, as some of `w`, `m` and `s` for weak, medium and strong, or `u` if `-score` was given.  The parse is a comma-separated list of the internal copy boundaries, i.e. the start of each copy after the first, relative to the start of the match, or `.` if the match is a single copy; the lists are truncated with `...` in the example above.  A copy begins where the alignment reaches the start of the unit, so its boundaries depend on the rotation of the unit sequence.  The parse uses the same convention as the `P` lines that FasTAN writes in `.1ano` files.
 
 Percent identity can be calculated as 100 * (exact matches) / (end - start).  This measures exact matches against the span of the target, so bases of the unit that are skipped by a gap do not add to the denominator.  Matches from different units, or from the two strands of one unit, can overlap, but if two matches of the same unit on the same strand end at the same place then only the better one is kept, and the number removed is reported on stderr.
 
-With `-bed <file>` a standard [BED](https://en.wikipedia.org/wiki/BED_(file_format)) file with six columns is also written: the target, start, end, unit name, the identity in parts per thousand, `(int)(1000*matches/(end-start))`, in the score column, and the strand.  If `-bed` is given without `-o` then nothing is written to standard output; if both are given then both files are written.
+With `-bed <file>` a standard [BED](https://en.wikipedia.org/wiki/BED_(file_format)) file with six columns is written: the target, start, end, unit name, the identity in parts per thousand, `(int)(1000*matches/(end-start))`, in the score column, and the strand.
+
+With `-1 <file>` satscan writes a binary [ONEcode](https://github.com/thegenemyers/ONEcode) file of type `rep`, a secondary type of `ano` (the schema is in `onerep.h`).  It records the satscan command line, and references the unit file (2) and the genome file (1).  It then contains the genome skeleton, i.e. the sequence names with their contigs and gaps (as in a `.1gdb` file, but made directly from the sequence file as it is scanned), and a free-standing library with an `I` object (name and length) and a `Y` type for each unit scanned, "tandem" unless a `.1lib` file gave another type.  Then there is an `M` object for each match, with the sequence index (0-based, in the order of the skeleton), start and end, followed by `B`, the identity in parts per thousand, `T`, the unit length and the index of the unit in the library (1-based, the same for both strands), `R` if the reverse complement of the unit matched, and `P`, the parse into copies of the unit, if there is more than one copy.  Use `ONEview` to see a `.1rep` file in ascii.  For the 145Mb Drosophila melanogaster genome and five satellite units, which takes about 7 seconds:
+
+```
+> satscan -1 dmel-sat.1rep dmel-sat.fa dmel.fa.gz
+> ONEview dmel-sat.1rep
+1 3 ano 2 1
+2 3 rep
+! 4 7 satscan 3 0.1 73 satscan -1 dmel-sat.1rep dmel-sat.fa dmel.fa.gz 19 2026-10-20_02:48:31
+< 11 dmel-sat.fa 2
+< 10 dmel.fa.gz 1
+...
+g
+S 1 A
+C 15637797
+G 62
+C 649
+...
+l
+I 9 sat-1-233 233
+Y 6 tandem
+I 9 sat-2-359 359
+Y 6 tandem
+...
+M 0 233242 280188
+B 664
+T 359 2
+R
+P 132 358 713 1042 1400 1757 2110 ...
+M 0 728472 730045
+B 845
+T 31 3
+P 49 31 72 107 146 177 218 ...
+M 0 730537 731958
+...
+```
+
+The match score, the exact match count and the scoring schemes used are not in the `.1rep` file, since `.1rep` files from different tools and scoring schemes are meant to be merged; use `-tsv` for those.
 
 Tied alignments are resolved in favour of more exact matches.  The sequences are scanned by `-T` threads (default 8), each working on one target sequence at a time, so the time is limited by the longest sequence; the results are the same for any number of threads.  Up to about two sequences per thread are held in memory at once.  As an indication of speed, scanning the 3.1Gb human genome for the single 171bp unit above took about 26 seconds with the default 8 threads, and for 12 units of 20 to 171bp about 3 minutes.
 
@@ -135,8 +175,9 @@ Options are:
 
 | Option | Meaning |
 |---|---|
-| `-o <file>` | write the main output to this file (default standard output, unless `-bed` is given) |
-| `-bed <file>` | also write BED6 output to this file |
+| `-1 <file>` | write a binary ONEcode `.1rep` file of the matches |
+| `-tsv <file>` | write tab-separated text output to this file |
+| `-bed <file>` | write BED6 output to this file |
 | `-score <m>,<ti>,<tv>,<go>,<ge>` | use this one scoring scheme everywhere instead of the hierarchical schemes: match, transition, transversion, gap open and gap extend scores, e.g. `-score 1,-1,-2,-7,-1` |
 | `-smin <n>` | minimum score to report a match (default 50) |
 | `-xmin <n>` | minimum x-drop (default 200) |

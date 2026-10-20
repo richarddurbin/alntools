@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Aug 10 13:08 2026 (rd109)
+ * Last edited: Oct 21 10:30 2026 (claude)
  * Created: Thu Oct 16 02:49:56 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -134,5 +134,14 @@ void writeGdb (OneFile *of, Gdb *gdb, int k, FILE *report) ;
 void gdbDestroy (Gdb *gdb) ;
 
 OneFile *gdbFile (OneFile *ofAln, int number) ;
+
+// to build a Gdb from sequences as they are read: create a builder, add each sequence as text
+// (contigs break at any character other than ACGTacgt), then gdbFromBuilder() returns the Gdb and
+// destroys the builder. seqFileName is not copied: it must last as long as the Gdb.
+typedef struct GdbBuilderStruct GdbBuilder ;
+GdbBuilder *gdbBuilderCreate (char *seqFileName) ;
+void gdbAddSequence (GdbBuilder *gb, char *name, char *seq, I64 len) ;
+Gdb *gdbFromBuilder (GdbBuilder *gb) ;
+Gdb *gdbMakeFromFile (char *seqFileName, FILE *report) ; // all in one; writes a summary line if report
 
 /************************ end of file *************************/

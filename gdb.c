@@ -5,12 +5,14 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Aug 10 15:24 2026 (rd109)
+ * Last edited: Oct 21 10:30 2026 (claude)
  * Created: Sun Oct 19 21:45:26 2025 (rd109)
  *-------------------------------------------------------------------
  */
 
 #include "alntools.h"
+#include "array.h"
+#include "seqio.h"
 
 void reportGdb (Gdb *gdb, FILE *f)
 { fprintf (f, "%d seqs %d contigs (%d gaps)", gdb->nSeq, gdb->nCtg, gdb->nGap) ;
@@ -181,6 +183,84 @@ void gdbDestroy (Gdb *gdb)
     }
 #endif
   newFree (gdb, 1, Gdb) ;
+}
+
+/************ building a Gdb from sequences as they are read ************/
+
+struct GdbBuilderStruct {
+  Gdb   *gdb ;		// counts and totals are kept here as sequences are added
+  Array  seqLen, ctgLen, ctgSeq, ctgPos ;	// of I64, I64, int, I64
+} ;
+
+static bool isGdbBase[256] ;	// ACGTacgt: any other character is in a gap
+
+GdbBuilder *gdbBuilderCreate (char *seqFileName)
+{
+  if (!isGdbBase['a']) for (char *c = "ACGTacgt" ; *c ; ++c) isGdbBase[(int)*c] = true ;
+  GdbBuilder *gb = new0 (1, GdbBuilder) ;
+  gb->gdb = new0 (1, Gdb) ;
+  gb->gdb->seqFileName = seqFileName ;
+  gb->gdb->seqDict = dictCreate (1024) ;
+  gb->seqLen = arrayCreate (1024, I64) ;
+  gb->ctgLen = arrayCreate (1024, I64) ;
+  gb->ctgSeq = arrayCreate (1024, int) ;
+  gb->ctgPos = arrayCreate (1024, I64) ;
+  return gb ;
+}
+
+void gdbAddSequence (GdbBuilder *gb, char *name, char *seq, I64 len) // seq is text
+{
+  Gdb *gdb = gb->gdb ;
+  if (!dictAdd (gdb->seqDict, name, 0)) die ("duplicate sequence name %s in %s", name, gdb->seqFileName) ;
+  array(gb->seqLen, gdb->nSeq, I64) = len ;
+  gdb->totSeq += len ;
+  I64 i = 0 ;
+  while (i < len)
+    { I64 j = i ;
+      if (isGdbBase[(U8)seq[i]])
+	{ while (j < len && isGdbBase[(U8)seq[j]]) ++j ;
+	  array(gb->ctgLen, gdb->nCtg, I64) = j - i ;
+	  array(gb->ctgSeq, gdb->nCtg, int) = gdb->nSeq ;
+	  array(gb->ctgPos, gdb->nCtg, I64) = i ;
+	  gdb->totCtg += j - i ;
+	  ++gdb->nCtg ;
+	}
+      else
+	{ while (j < len && !isGdbBase[(U8)seq[j]]) ++j ;
+	  ++gdb->nGap ;
+	}
+      i = j ;
+    }
+  ++gdb->nSeq ;
+}
+
+// copy the arrays into allocations of exactly nSeq and nCtg, as gdbDestroy() expects
+Gdb *gdbFromBuilder (GdbBuilder *gb)
+{
+  Gdb *gdb = gb->gdb ;
+  gdb->maxSeq = gdb->nSeq ; gdb->maxCtg = gdb->nCtg ;
+  gdb->seqLen = new (gdb->nSeq, I64) ; memcpy (gdb->seqLen, arrp(gb->seqLen,0,I64), gdb->nSeq*sizeof(I64)) ;
+  gdb->ctgLen = new (gdb->nCtg, I64) ; memcpy (gdb->ctgLen, arrp(gb->ctgLen,0,I64), gdb->nCtg*sizeof(I64)) ;
+  gdb->ctgSeq = new (gdb->nCtg, int) ; memcpy (gdb->ctgSeq, arrp(gb->ctgSeq,0,int), gdb->nCtg*sizeof(int)) ;
+  gdb->ctgPos = new (gdb->nCtg, I64) ; memcpy (gdb->ctgPos, arrp(gb->ctgPos,0,I64), gdb->nCtg*sizeof(I64)) ;
+  arrayDestroy (gb->seqLen) ; arrayDestroy (gb->ctgLen) ; arrayDestroy (gb->ctgSeq) ; arrayDestroy (gb->ctgPos) ;
+  newFree (gb, 1, GdbBuilder) ;
+  return gdb ;
+}
+
+Gdb *gdbMakeFromFile (char *seqFileName, FILE *report)
+{
+  SeqIO *sio = seqIOopenRead (seqFileName, 0, false) ; // no conversion: gaps need the original characters
+  if (!sio) die ("failed to open sequence file %s", seqFileName) ;
+  GdbBuilder *gb = gdbBuilderCreate (seqFileName) ;
+  while (seqIOread (sio)) gdbAddSequence (gb, sqioId(sio), sqioSeq(sio), sio->seqLen) ;
+  seqIOclose (sio) ;
+  Gdb *gdb = gdbFromBuilder (gb) ;
+  if (report)
+    { fprintf (report, "made GDB from %s : ", seqFileName) ;
+      reportGdb (gdb, report) ;
+    }
+  return gdb ;
 }
 
 /********************** main function for gdbmask ******************************/
