@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 21 10:30 2026 (claude)
+ * Last edited: Oct 25 23:47 2026 (claude)
  * Created: Sun Oct 19 21:45:26 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -13,6 +13,7 @@
 #include "alntools.h"
 #include "array.h"
 #include "seqio.h"
+#include <ctype.h>
 
 void reportGdb (Gdb *gdb, FILE *f)
 { fprintf (f, "%d seqs %d contigs (%d gaps)", gdb->nSeq, gdb->nCtg, gdb->nGap) ;
@@ -78,6 +79,12 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) // don't report if !report
 	end = 0 ; // reset counter
 	++gdb->nSeq ;
 	break ;
+      case 'c':
+	if (!gdb->nSeq) die ("c line before S line in GDB") ;
+	if (!gdb->chromNames) gdb->chromNames = new0 (gdb->maxSeq, char*) ;
+	gdb->chromNames[gdb->nSeq-1] = new (oneLen(of)+1, char) ;
+	strcpy (gdb->chromNames[gdb->nSeq-1], oneString(of)) ;
+	break ;
       case 'G':
 	if (!gdb->nSeq) die ("G line before S line in GDB") ;
 	end += oneInt(of,0) ;
@@ -139,6 +146,8 @@ void writeGdb (OneFile *of, Gdb *gdb, int k, FILE *report)
   for (i = 0 ; i < gdb->nSeq ; ++i)
     { char *name = dictName(gdb->seqDict,i) ;
       oneWriteLine (of, 'S', strlen(name), name) ;
+      if (gdb->chromNames && gdb->chromNames[i])
+	oneWriteLine (of, 'c', strlen(gdb->chromNames[i]), gdb->chromNames[i]) ;
       end = 0 ;
       while (j < gdb->nCtg && gdb->ctgSeq[j] == i)
 	{ if (gdb->ctgPos[j] > end)
@@ -175,6 +184,11 @@ void gdbDestroy (Gdb *gdb)
   newFree (gdb->ctgLen, gdb->maxCtg, I64) ;
   newFree (gdb->ctgSeq, gdb->maxCtg, int) ;
   newFree (gdb->ctgPos, gdb->maxCtg, I64) ;
+  if (gdb->chromNames)
+    { for (int i = 0 ; i < gdb->maxSeq ; ++i)
+	if (gdb->chromNames[i]) newFree (gdb->chromNames[i], strlen(gdb->chromNames[i])+1, char) ;
+      newFree (gdb->chromNames, gdb->maxSeq, char*) ;
+    }
 #ifdef GDB_MASK
   if (gdb->maxMask)
     { newFree (gdb->ctgMaskCount, gdb->maxCtg, int) ;
@@ -183,6 +197,87 @@ void gdbDestroy (Gdb *gdb)
     }
 #endif
   newFree (gdb, 1, Gdb) ;
+}
+
+/************ naming chromosomes from the sequence names ************/
+
+// Sets gdb->chromNames, unless it is already set (e.g. from c lines), in one of three ways:
+// (a) If any sequence name starts with chr, Chr or CHR, each such sequence is a chromosome, named with the
+//     prefix chr, e.g. ChrX becomes chrX; chrM, ChrM, mito, Mito, mitochondrion and Mitochondrion are mito.
+// (b) Otherwise, if the names are INSDC accessions, i.e. capital letters and underscores, then digits, then
+//     . and a version number, as from NCBI or ENA, the initial run of sequences whose prefix of letters and
+//     underscores is the same as the first one's are chromosomes, named chr1, chr2, ... in order, except
+//     that one shorter than MITO_MAX is mito. Later sequences, e.g. scaffolds, have other prefixes. If the
+//     first prefix is NW_ or NT_, RefSeq's prefixes for scaffolds and contigs, there are no chromosomes.
+// (c) Otherwise, sequences named by a single letter A to F are the Drosophila Muller elements, named MullerA
+//     to MullerF.
+// Otherwise no chromosomes are named. Mitochondria of plants and protists can be longer than MITO_MAX.
+
+#define MITO_MAX 50000
+
+static char *stringCopy (char *s) { char *t = new (strlen(s)+1, char) ; strcpy (t, s) ; return t ; }
+
+static bool isMitoName (char *s)
+{ return !strcmp (s, "chrM") || !strcmp (s, "ChrM") || !strcmp (s, "mito") || !strcmp (s, "Mito")
+    || !strcmp (s, "mitochondrion") || !strcmp (s, "Mitochondrion") ;
+}
+
+static int insdcPrefixLen (char *s) // length of the prefix of an INSDC accession, else 0
+{
+  char *t = s ;
+  while ((*t >= 'A' && *t <= 'Z') || *t == '_') ++t ;
+  int len = t - s ;
+  if (!len || !isdigit(*t)) return 0 ;
+  while (isdigit(*t)) ++t ;
+  if (*t++ != '.' || !isdigit(*t)) return 0 ;
+  while (isdigit(*t)) ++t ;
+  return *t ? 0 : len ;
+}
+
+void gdbMakeChromosomes (Gdb *gdb)
+{
+  if (gdb->chromNames || !gdb->nSeq) return ;
+  int i ;
+  for (i = 0 ; i < gdb->nSeq ; ++i)
+    { char *name = dictName(gdb->seqDict, i) ;
+      if (!strncmp (name, "chr", 3) || !strncmp (name, "Chr", 3) || !strncmp (name, "CHR", 3)) break ;
+    }
+  if (i < gdb->nSeq)	// (a)
+    { gdb->chromNames = new0 (gdb->maxSeq, char*) ;
+      for (i = 0 ; i < gdb->nSeq ; ++i)
+	{ char *name = dictName(gdb->seqDict, i) ;
+	  if (isMitoName (name))
+	    gdb->chromNames[i] = stringCopy ("mito") ;
+	  else if (!strncmp (name, "chr", 3) || !strncmp (name, "Chr", 3) || !strncmp (name, "CHR", 3))
+	    { gdb->chromNames[i] = new (strlen(name)+1, char) ;
+	      strcpy (gdb->chromNames[i], "chr") ; strcpy (gdb->chromNames[i]+3, name+3) ;
+	    }
+	}
+      return ;
+    }
+  char *first = dictName(gdb->seqDict, 0) ;	// (b)
+  int prefixLen = insdcPrefixLen (first) ;
+  if (!prefixLen)	// (c)
+    { for (i = 0 ; i < gdb->nSeq ; ++i)
+	{ char *name = dictName(gdb->seqDict, i) ;
+	  if (name[0] >= 'A' && name[0] <= 'F' && !name[1])
+	    { if (!gdb->chromNames) gdb->chromNames = new0 (gdb->maxSeq, char*) ;
+	      char buf[8] ; sprintf (buf, "Muller%c", name[0]) ; gdb->chromNames[i] = stringCopy (buf) ;
+	    }
+	}
+      return ;
+    }
+  if (prefixLen == 3 && (!strncmp (first, "NW_", 3) || !strncmp (first, "NT_", 3))) return ;
+  gdb->chromNames = new0 (gdb->maxSeq, char*) ;
+  int nChrom = 0 ;
+  for (i = 0 ; i < gdb->nSeq ; ++i)
+    { char *name = dictName(gdb->seqDict, i) ;
+      if (insdcPrefixLen (name) != prefixLen || strncmp (name, first, prefixLen)) break ;
+      if (gdb->seqLen[i] < MITO_MAX)
+	gdb->chromNames[i] = stringCopy ("mito") ;
+      else
+	{ char buf[32] ; sprintf (buf, "chr%d", ++nChrom) ; gdb->chromNames[i] = stringCopy (buf) ; }
+    }
 }
 
 /************ building a Gdb from sequences as they are read ************/

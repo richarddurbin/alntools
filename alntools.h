@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 21 10:30 2026 (claude)
+ * Last edited: Oct 25 23:41 2026 (claude)
  * Created: Thu Oct 16 02:49:56 2025 (rd109)
  *-------------------------------------------------------------------
  */
@@ -24,6 +24,7 @@ static char schemaText[] =
   "D f 4 4 REAL 4 REAL 4 REAL 4 REAL   global: base frequency vector\n"
   "D u 0                               global: upper case when displayed\n"
   "O S 1 6 STRING                      id for a scaffold\n"
+  "D c 1 6 STRING                      chromosome name, e.g. chr1 or mito\n"
   "D G 1 3 INT                         gap of given length\n"
   "D C 1 3 INT                         contig of given length\n"
 #ifdef GDB_MASK
@@ -43,6 +44,7 @@ static char schemaText[] =
   "O g 0                       groups scaffolds into a GDB skeleton\n"
   "G S                         collection of scaffolds constituting a GDB\n"
   "O S 1 6 STRING              id for a scaffold\n"
+  "D c 1 6 STRING              chromosome name, e.g. chr1 or mito\n"
   "D G 1 3 INT                 gap of given length\n"
   "D C 1 3 INT                 contig of given length\n"
   //"D M 1 8 INT_LIST            mask pair list for a contig\n"
@@ -66,6 +68,7 @@ static char schemaText[] =
   "O g 0                       groups scaffolds into a GDB skeleton\n"
   "G S                         collection of scaffolds constituting a GDB\n"
   "O S 1 6 STRING              id for a scaffold\n"
+  "D c 1 6 STRING              chromosome name, e.g. chr1 or mito\n"
   "D G 1 3 INT                 gap of given length\n"
   "D C 1 3 INT                 contig of given length\n"
   ".\n"
@@ -83,6 +86,7 @@ typedef struct {
   I64    maxSeq, totSeq ;       // max and total length of sequences
   I64    maxCtg, totCtg ;       // max and total length of contigs
   DICT  *seqDict ;       	// names of sequences
+  char **chromNames ;		// 'c' chromosome name for each sequence, e.g. chr1 or mito, else 0; 0 if none
   I64   *seqLen ;	 	// lengths of sequences
   I64   *ctgLen ;	 	// contig lengths
   int   *ctgSeq ;	 	// parent sequence for each contig
@@ -132,6 +136,7 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) ;
 void writeGdb (OneFile *of, Gdb *gdb, int k, FILE *report) ;
 
 void gdbDestroy (Gdb *gdb) ;
+void gdbMakeChromosomes (Gdb *gdb) ; // sets chromNames from the sequence names, see gdb.c
 
 OneFile *gdbFile (OneFile *ofAln, int number) ;
 

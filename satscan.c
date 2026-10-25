@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 21 00:32 2026 (claude)
+ * Last edited: Oct 25 23:41 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -866,11 +866,132 @@ static int matchOrder (const void *a, const void *b)
   return 0 ;
 }
 
+// Matches of the same unit on a target, on either strand, are grouped into clusters, following the density
+// clustering of Yusuf Mohamedy (github.com/yusufmohamedy/VGP-Centromeres-Project). Overlapping or abutting
+// matches are merged into blocks. A block scores its length, and a gap of g bp between blocks scores 0 if
+// g <= GAP_FREE, otherwise -GAP_COEFF * g * f, where f = log(g/GAP_FREE)/log(GAP_FULL/GAP_FREE) up to 1.
+// A gap longer than GAP_MAX always separates clusters. The clusters are the maximal scoring segments
+// (Ruzzo and Tompa 1999) of the alternating block and gap scores. So a cluster extends across a gap only
+// if the blocks beyond it score more than the gap costs. Every block scores positive, so every match is
+// in exactly one cluster, perhaps on its own.
+#define GAP_COEFF 1.0
+#define GAP_FREE  1000
+#define GAP_FULL  1000000
+#define GAP_MAX   1000000
+
+typedef struct {
+  int  target, unit ;	// unit is the index of the forward query
+  U64  start, end ;
+  U64  first, n ;	// its matches are first..first+n-1 in the array sorted by unitOrder
+} Cluster ;
+
+typedef struct { U64 start, end, first ; } Block ; // first: index of its first match
+typedef struct { int first, last ; double L, R ; } ScoreSeg ; // blocks first..last, cumulative scores before and after
+
+// sorts by target, then unit, then start position, then query with the forward one first
+static int unitOrder (const void *a, const void *b)
+{
+  const Match *x = *(Match* const*)a, *y = *(Match* const*)b ;
+  if (x->target != y->target) return x->target < y->target ? -1 : 1 ;
+  int xq = x->query % nQueryFwd, yq = y->query % nQueryFwd ;
+  if (xq != yq) return xq < yq ? -1 : 1 ;
+  if (x->start != y->start) return x->start < y->start ? -1 : 1 ;
+  if (x->query != y->query) return x->query < y->query ? -1 : 1 ;
+  return 0 ;
+}
+
+// sorts by target, then start position, then unit
+static int clusterOrder (const void *a, const void *b)
+{
+  const Cluster *x = (const Cluster*)a, *y = (const Cluster*)b ;
+  if (x->target != y->target) return x->target < y->target ? -1 : 1 ;
+  if (x->start != y->start) return x->start < y->start ? -1 : 1 ;
+  if (x->unit != y->unit) return x->unit < y->unit ? -1 : 1 ;
+  return 0 ;
+}
+
+static double gapPenalty (U64 g)
+{
+  if (g <= GAP_FREE) return 0 ;
+  double f = log ((double)g / GAP_FREE) / log ((double)GAP_FULL / GAP_FREE) ;
+  return GAP_COEFF * (f < 1 ? f : 1) * g ;
+}
+
+// Ruzzo-Tompa: the maximal scoring segments of blocks k0..k1-1 and the gaps between them, in order, into aSeg.
+// Each new block starts a segment, which is merged with earlier ones while that raises its score.
+static void maxSegments (Array aBlock, int k0, int k1, Array aSeg)
+{
+  arrayMax(aSeg) = 0 ;
+  double cum = 0 ;	// the scores within a run are at most its length in bp, so cum is exact enough
+  for (int k = k0 ; k < k1 ; ++k)
+    { Block *b = arrp(aBlock, k, Block) ;
+      if (k > k0) cum -= gapPenalty (b->start - arrp(aBlock, k-1, Block)->end) ;
+      ScoreSeg s = { k, k, cum, cum + (b->end - b->start) } ;
+      cum = s.R ;
+      while (true)
+	{ int j = arrayMax(aSeg) - 1 ; // the last segment whose L is below s.L
+	  while (j >= 0 && arrp(aSeg, j, ScoreSeg)->L >= s.L) --j ;
+	  if (j < 0 || arrp(aSeg, j, ScoreSeg)->R >= s.R)
+	    { array(aSeg, arrayMax(aSeg), ScoreSeg) = s ; break ; }
+	  s.first = arrp(aSeg, j, ScoreSeg)->first ; s.L = arrp(aSeg, j, ScoreSeg)->L ;
+	  arrayMax(aSeg) = j ; // s now covers segments j onwards
+	}
+    }
+}
+
+// Fills aSorted with the matches in unitOrder and returns the clusters, in clusterOrder.
+static Array makeClusters (Array aMatch, Array aSorted)
+{
+  U64 n = arrayMax(aMatch) ;
+  arrayMax(aSorted) = 0 ;
+  for (U64 i = 0 ; i < n ; ++i) array(aSorted, i, Match*) = arr(aMatch, i, Match*) ;
+  arraySort (aSorted, unitOrder) ;
+
+  Array aCluster = arrayCreate (1024, Cluster) ;
+  Array aBlock = arrayCreate (1024, Block) ;
+  Array aSeg = arrayCreate (1024, ScoreSeg) ;
+  for (U64 i = 0, j ; i < n ; i = j) // the matches of one target and unit are i..j-1
+    { Match *m = arr(aSorted, i, Match*) ;
+      int target = m->target, unit = m->query % nQueryFwd ;
+      arrayMax(aBlock) = 0 ;
+      for (j = i ; j < n ; ++j)
+	{ m = arr(aSorted, j, Match*) ;
+	  if (m->target != target || m->query % nQueryFwd != unit) break ;
+	  Block *b = arrayMax(aBlock) ? arrp(aBlock, arrayMax(aBlock)-1, Block) : 0 ;
+	  if (b && m->start <= b->end)	// overlaps or abuts the current block
+	    { if (m->bestEnd > b->end) b->end = m->bestEnd ; }
+	  else
+	    { b = arrayp(aBlock, arrayMax(aBlock), Block) ;
+	      b->start = m->start ; b->end = m->bestEnd ; b->first = j ;
+	    }
+	}
+      int nBlock = arrayMax(aBlock) ;
+      for (int k0 = 0, k1 ; k0 < nBlock ; k0 = k1) // runs of blocks k0..k1-1 with no gap over GAP_MAX
+	{ for (k1 = k0+1 ; k1 < nBlock ; ++k1)
+	    if (arrp(aBlock, k1, Block)->start - arrp(aBlock, k1-1, Block)->end > GAP_MAX) break ;
+	  maxSegments (aBlock, k0, k1, aSeg) ;
+	  for (int s = 0 ; s < arrayMax(aSeg) ; ++s)
+	    { ScoreSeg *seg = arrp(aSeg, s, ScoreSeg) ;
+	      Block *bf = arrp(aBlock, seg->first, Block), *bl = arrp(aBlock, seg->last, Block) ;
+	      Cluster *c = arrayp(aCluster, arrayMax(aCluster), Cluster) ;
+	      c->target = target ; c->unit = unit ;
+	      c->start = bf->start ; c->end = bl->end ; // blocks are disjoint and in order
+	      c->first = bf->first ;
+	      c->n = (seg->last+1 < nBlock ? arrp(aBlock, seg->last+1, Block)->first : j) - bf->first ;
+	    }
+	}
+    }
+  arrayDestroy (aBlock) ; arrayDestroy (aSeg) ;
+  arraySort (aCluster, clusterOrder) ;
+  return aCluster ;
+}
+
 // Write the matches as a binary .1rep file: the genome skeleton, a free-standing library block with an
-// I object for each forward query, then one M object per match, in the same order as the text output.
-// T's library index is the 1-based index of the query's I object, the same for both strands.
+// I object for each forward query, then one m object per cluster, in clusterOrder, each followed by its
+// M objects in order of start. T's library index is the 1-based index of the query's I object, the same
+// for both strands.
 static void writeRep (char *fileName, OneSchema *schema, Gdb *gdb, char *queryFileName,
-		      Array aQuery, Array aMatch)
+		      Array aQuery, Array aCluster, Array aSorted)
 {
   bool isBinary = strcmp (fileName, "-") ;
   
@@ -895,25 +1016,30 @@ static void writeRep (char *fileName, OneSchema *schema, Gdb *gdb, char *queryFi
 	}
     }
   
-  // write the matches
+  // write the clusters and their matches
   I64 *parse = 0 ; int maxParse = 0 ;
-  for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
-    { Match *m = arr(aMatch, i, Match*) ;
-      Query *q = arrp(aQuery, m->query, Query) ;
-      oneInt(of,0) = m->target ; oneInt(of,1) = m->start ; oneInt(of,2) = m->bestEnd ;
-      oneWriteLine (of, 'M', 0, 0) ;
-      oneInt(of,0) = (1000 * (m->bestScore & 0xffffffff)) / (m->bestEnd - m->start) ;
-      oneWriteLine (of, 'B', 0, 0) ;
-      oneInt(of,0) = q->len ; oneInt(of,1) = m->query % nQueryFwd + 1 ;
-      oneWriteLine (of, 'T', 0, 0) ;
-      if (q->isRC) oneWriteLine (of, 'R', 0, 0) ;
-      if (m->nParse)
-	{ if (m->nParse > maxParse)
-	    { if (parse) newFree (parse, maxParse, I64) ;
-	      maxParse = m->nParse ; parse = new (maxParse, I64) ;
+  for (U64 c = 0 ; c < arrayMax(aCluster) ; ++c)
+    { Cluster *cl = arrp(aCluster, c, Cluster) ;
+      oneInt(of,0) = cl->n ; oneInt(of,1) = cl->target ; oneInt(of,2) = cl->start ; oneInt(of,3) = cl->end ;
+      oneWriteLine (of, 'm', 0, 0) ;
+      for (U64 i = cl->first ; i < cl->first + cl->n ; ++i)
+	{ Match *m = arr(aSorted, i, Match*) ;
+	  Query *q = arrp(aQuery, m->query, Query) ;
+	  oneInt(of,0) = m->target ; oneInt(of,1) = m->start ; oneInt(of,2) = m->bestEnd ;
+	  oneWriteLine (of, 'M', 0, 0) ;
+	  oneInt(of,0) = (1000 * (m->bestScore & 0xffffffff)) / (m->bestEnd - m->start) ;
+	  oneWriteLine (of, 'B', 0, 0) ;
+	  oneInt(of,0) = q->len ; oneInt(of,1) = m->query % nQueryFwd + 1 ;
+	  oneWriteLine (of, 'T', 0, 0) ;
+	  if (q->isRC) oneWriteLine (of, 'R', 0, 0) ;
+	  if (m->nParse)
+	    { if (m->nParse > maxParse)
+		{ if (parse) newFree (parse, maxParse, I64) ;
+		  maxParse = m->nParse ; parse = new (maxParse, I64) ;
+		}
+	      for (int k = 0 ; k < m->nParse ; ++k) parse[k] = m->parse[k] ;
+	      oneWriteLine (of, 'P', m->nParse, parse) ;
 	    }
-	  for (int k = 0 ; k < m->nParse ; ++k) parse[k] = m->parse[k] ;
-	  oneWriteLine (of, 'P', m->nParse, parse) ;
 	}
     }
   if (parse) newFree (parse, maxParse, I64) ;
@@ -930,11 +1056,11 @@ int main (int argc, char *argv[])
     "  Finds tandem matches of complete units with affine gap alignment. By default uses a hierarchical\n"
     "  scoring scheme to avoid composition-based false positives. A user-provided scoring scheme overrides this.\n"
     "  options are:\n"
-    "    -1 <file_name>     write a binary ONEcode .1rep file of the matches\n"
+    "    -1 <file_name>     write a binary ONEcode .1rep file of the matches, grouped into clusters\n"
     "    -tsv <file_name>   write tab-separated text: target, start, end, query, score, exact matches,\n"
     "                       strand, parse into copies, schemes used\n"
     "    -bed <file_name>   write BED6 to this file: target, start, end, query, per-mil identity, strand\n"
-    "                       [with none of -1, -tsv or -bed, the match lines of a .1rep go to standard output]\n"
+    "                       [with none of -1, -tsv or -bed, the cluster and match lines of a .1rep go to stdout]\n"
     "    -score <m>,<ti>,<tv>,<go>,<ge>  match, transition, transversion, gap open and gap extend scores,\n"
     "                       used everywhere, e.g. -score 1,-1,-2,-7,-1 [by default weak 2,-1,-3,-15,-1,\n"
     "                       medium 2,-2,-4,-20,-2 or strong 2,-3,-6,-25,-2, chosen by region composition]\n"
@@ -947,7 +1073,7 @@ int main (int argc, char *argv[])
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
   FILE *tsvFile = 0, *bedFile = 0 ;
-  char *repFileName = 0 ;   // with none of these, writeRep() writes ascii match lines to stdout
+  char *repFileName = 0 ;   // with none of these, writeRep() writes ascii cluster and match lines to stdout
   ScoreParams userScheme ;
   bool isUserScheme = false ;
   bool isAllowOverlaps = false ;
@@ -1157,9 +1283,12 @@ int main (int argc, char *argv[])
 	  array(aMatch, arrayMax(aMatch), Match*) = arr(w->aMatch, i, Match*) ;
     }
   arraySort (aMatch, matchOrder) ;
+  Array aSorted = arrayCreate (arrayMax(aMatch) + 1, Match*) ;
+  Array aCluster = makeClusters (aMatch, aSorted) ;
   if (repFileName)
     { Gdb *gdb = gdbFromBuilder (gb) ;
-      writeRep (repFileName, schema, gdb, queryFileName, aQuery, aMatch) ;
+      gdbMakeChromosomes (gdb) ;
+      writeRep (repFileName, schema, gdb, queryFileName, aQuery, aCluster, aSorted) ;
       gdbDestroy (gdb) ;
     }
   if (tsvFile || bedFile)
@@ -1185,10 +1314,15 @@ int main (int argc, char *argv[])
 	}
     }
   else if (!repFileName)
-    writeRep ("-", schema, 0, queryFileName, aQuery, aMatch) ;
-  // per unit, both strands together: matches, bases, exact matches, and bases scanned with each scheme
+    writeRep ("-", schema, 0, queryFileName, aQuery, aCluster, aSorted) ;
+  // per unit, both strands together: matches, clusters, bases, exact matches, and bases scanned with each scheme
   U64 *uMatch = new0 (nQueryFwd, U64), *uLen = new0 (nQueryFwd, U64), *uCount = new0 (nQueryFwd, U64) ;
   U64 *uScheme = new0 (nQueryFwd*MAX_SCHEME, U64) ;
+  U64 *uCluster = new0 (nQueryFwd, U64), *uMulti = new0 (nQueryFwd, U64) ;
+  for (U64 c = 0 ; c < arrayMax(aCluster) ; ++c)
+    { Cluster *cl = arrp(aCluster, c, Cluster) ;
+      ++uCluster[cl->unit] ; if (cl->n > 1) ++uMulti[cl->unit] ;
+    }
   for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i) // whichever outputs were written
     { Match *m = arr(aMatch, i, Match*) ;
       int u = m->query % nQueryFwd ;
@@ -1209,8 +1343,9 @@ int main (int argc, char *argv[])
     { U64 nExcluded = 0 ;
       for (int t = 0 ; t < nThread ; ++t)
 	nExcluded += worker[t]->nExcludedQuery[u] + worker[t]->nExcludedQuery[u+nQueryFwd] ;
-      fprintf (stderr, "%s: %llu matches, %llu bp, identity %.1f%%, %llu excluded as overlapping",
-	       arrp(aQuery, u, Query)->name, uMatch[u], uLen[u], uLen[u] ? 100.0 * uCount[u] / uLen[u] : 0.0, nExcluded) ;
+      fprintf (stderr, "%s: %llu matches in %llu clusters (%llu of more than one), %llu bp, identity %.1f%%, %llu excluded as overlapping",
+	       arrp(aQuery, u, Query)->name, uMatch[u], uCluster[u], uMulti[u], uLen[u],
+	       uLen[u] ? 100.0 * uCount[u] / uLen[u] : 0.0, nExcluded) ;
       if (scan.nScheme > 1 && uLen[u])
 	fprintf (stderr, ", bases scanned weak %.1f%% medium %.1f%% strong %.1f%%",
 		 100.0 * uScheme[u*MAX_SCHEME] / uLen[u], 100.0 * uScheme[u*MAX_SCHEME+1] / uLen[u],
@@ -1219,6 +1354,8 @@ int main (int argc, char *argv[])
     }
   newFree (uMatch, nQueryFwd, U64) ; newFree (uLen, nQueryFwd, U64) ; newFree (uCount, nQueryFwd, U64) ;
   newFree (uScheme, nQueryFwd*MAX_SCHEME, U64) ;
+  newFree (uCluster, nQueryFwd, U64) ; newFree (uMulti, nQueryFwd, U64) ;
+  arrayDestroy (aCluster) ; arrayDestroy (aSorted) ;
   timeTotal(stderr) ;
 
   if (tsvFile) fclose (tsvFile) ;

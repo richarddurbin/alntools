@@ -5,7 +5,7 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 19 00:14 2026 (rd109)
+ * Last edited: Oct 25 22:22 2026 (rd109)
  * Created: Fri Oct 16 18:10:50 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -33,7 +33,7 @@ static char *repeatSchemaText = {
   "D Y 1 6 STRING               type of repeat, from some ontology\n"
   "D X 1 3 INT                  terminal repeat length, e.g. LTR of an LTR-RT\n"
   ".\n"
-  "O m 1 3 INT                  groups given number of following M objects\n"
+  "O m 4 3 INT 3 INT 3 INT 3 INT  cluster of M objects: number, sequence, start, end\n"
   "D i 1 6 STRING               identifier for group, e.g. CEN:1, <gene_name>\n"
   "G M                          \n"
   "O M 3 3 INT 3 INT 3 INT      sequence index, start, end\n" // annotated interval
