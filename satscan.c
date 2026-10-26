@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 26 17:43 2026 (claude)
+ * Last edited: Oct 26 22:08 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -977,12 +977,45 @@ static Array makeClusters (Array aMatch, Array aSorted)
   return aCluster ;
 }
 
+static int intDecreasing (const void *a, const void *b)
+{ int x = *(const int*)a, y = *(const int*)b ; return x > y ? -1 : x < y ; }
+
+// For each forward query u, both strands together, copyN50[u] is the N50 of the numbers of copies in its
+// matches: the copy number at which its matches taken from the most copies down first include half of all
+// their copies, or 0 if it has none. Only queries with copyN50 at least minCopyN50 make tandem arrays rather
+// than scattered copies, so only these are written to the .1rep: libIndex[u] is the 1-based index of u's I
+// object among those written, or 0 if u is not written.
+static void reportedQueries (Array aMatch, int minCopyN50, int *copyN50, int *libIndex)
+{
+  Array *aCopies = new0 (nQueryFwd, Array) ;
+  for (U64 i = 0 ; i < arrayMax(aMatch) ; ++i)
+    { Match *m = arr(aMatch, i, Match*) ;
+      int u = m->query % nQueryFwd ;
+      if (!aCopies[u]) aCopies[u] = arrayCreate (64, int) ;
+      array(aCopies[u], arrayMax(aCopies[u]), int) = m->nParse + 1 ;
+    }
+  int nReported = 0 ;
+  for (int u = 0 ; u < nQueryFwd ; ++u)
+    { copyN50[u] = 0 ;
+      if (aCopies[u])
+	{ Array a = aCopies[u] ;
+	  arraySort (a, intDecreasing) ;
+	  I64 total = 0, sum = 0 ;
+	  for (U64 k = 0 ; k < arrayMax(a) ; ++k) total += arr(a,k,int) ;
+	  for (U64 k = 0 ; k < arrayMax(a) && 2*sum < total ; ++k) { sum += arr(a,k,int) ; copyN50[u] = arr(a,k,int) ; }
+	  arrayDestroy (a) ;
+	}
+      libIndex[u] = (copyN50[u] && copyN50[u] >= minCopyN50) ? ++nReported : 0 ;
+    }
+  newFree (aCopies, nQueryFwd, Array) ;
+}
+
 // Write the matches as a binary .1rep file: the genome skeleton, a free-standing library block with an
-// I object for each forward query, then one m object per cluster, in clusterOrder, each followed by its
-// M objects in order of start. T's library index is the 1-based index of the query's I object, the same
-// for both strands.
+// I object for each forward query u that has libIndex[u], then one m object per cluster of such a query, in
+// clusterOrder, each followed by its M objects in order of start. T's library index is libIndex[u], the
+// 1-based index of the query's I object, the same for both strands.
 static void writeRep (char *fileName, OneSchema *schema, Gdb *gdb, char *queryFileName,
-		      Array aQuery, Array aCluster, Array aSorted)
+		      Array aQuery, Array aCluster, Array aSorted, int *libIndex)
 {
   bool isBinary = strcmp (fileName, "-") ;
   
@@ -999,7 +1032,8 @@ static void writeRep (char *fileName, OneSchema *schema, Gdb *gdb, char *queryFi
       // write the library
       oneWriteLine (of, 'l', 0, 0) ;
       for (int j = 0 ; j < nQueryFwd ; ++j)
-	{ Query *q = arrp(aQuery, j, Query) ;
+	{ if (!libIndex[j]) continue ;
+	  Query *q = arrp(aQuery, j, Query) ;
 	  char *type = q->type ? q->type : "Satellite" ;
 	  oneInt(of,1) = q->len ;
 	  oneWriteLine (of, 'I', strlen(q->name), q->name) ;
@@ -1011,6 +1045,7 @@ static void writeRep (char *fileName, OneSchema *schema, Gdb *gdb, char *queryFi
   I64 *parse = 0 ; int maxParse = 0 ;
   for (U64 c = 0 ; c < arrayMax(aCluster) ; ++c)
     { Cluster *cl = arrp(aCluster, c, Cluster) ;
+      if (!libIndex[cl->unit]) continue ;
       oneInt(of,0) = cl->n ; oneInt(of,1) = cl->target ; oneInt(of,2) = cl->start ; oneInt(of,3) = cl->end ;
       oneWriteLine (of, 'm', 0, 0) ;
       for (U64 i = cl->first ; i < cl->first + cl->n ; ++i)
@@ -1020,7 +1055,7 @@ static void writeRep (char *fileName, OneSchema *schema, Gdb *gdb, char *queryFi
 	  oneWriteLine (of, 'M', 0, 0) ;
 	  oneInt(of,0) = (1000 * (m->bestScore & 0xffffffff)) / (m->bestEnd - m->start) ;
 	  oneWriteLine (of, 'B', 0, 0) ;
-	  oneInt(of,0) = q->len ; oneInt(of,1) = m->query % nQueryFwd + 1 ;
+	  oneInt(of,0) = q->len ; oneInt(of,1) = libIndex[m->query % nQueryFwd] ;
 	  oneWriteLine (of, 'T', 0, 0) ;
 	  if (q->isRC) oneWriteLine (of, 'R', 0, 0) ;
 	  if (m->nParse)
@@ -1058,6 +1093,8 @@ int main (int argc, char *argv[])
     "    -smin <n>          minimum score to report [50]\n"
     "    -xmin <n>          minimum x-drop: a match drops cells more than the x-drop below its best [200]\n"
     "    -xfac <x>          x-drop is the larger of xmin and xfac times the unit length [2.0]\n"
+    "    -minCopyN50 <n>    write to the .1rep only units whose matches have an N50 of at least n copies,\n"
+    "                       i.e. that make tandem arrays rather than scattered copies [10]\n"
     "    -allowOverlaps     keep matches that overlap [by default only the best of overlapping matches is\n"
     "                       kept, and the others are rescanned around it]\n"
     "    -T <n>             number of scanning threads [8]\n" ;
@@ -1068,6 +1105,7 @@ int main (int argc, char *argv[])
   ScoreParams userScheme ;
   bool isUserScheme = false ;
   bool isAllowOverlaps = false ;
+  int minCopyN50 = 10 ;
   U64 scoreMin = 50 ;
   int xMin = 200 ;
   double xFac = 2.0 ;
@@ -1101,6 +1139,11 @@ int main (int argc, char *argv[])
           userScheme.match = m ; userScheme.transition = ti ; userScheme.transversion = tv ;
           userScheme.gapOpen = (I64)go * ONE ; userScheme.gapExtend = (I64)ge * ONE ;
           isUserScheme = true ;
+          argc-- ;
+        }
+      else if (!strcmp (*argv, "-minCopyN50") && argc > 1)
+        { minCopyN50 = atoi (*++argv) ;
+          if (minCopyN50 < 0) die ("bad minCopyN50 %s - must be non-negative\n%s", *argv, usage) ;
           argc-- ;
         }
       else if (!strcmp (*argv, "-allowOverlaps"))
@@ -1281,10 +1324,12 @@ int main (int argc, char *argv[])
   arraySort (aMatch, matchOrder) ;
   Array aSorted = arrayCreate (arrayMax(aMatch) + 1, Match*) ;
   Array aCluster = makeClusters (aMatch, aSorted) ;
+  int *copyN50 = new (nQueryFwd, int), *libIndex = new (nQueryFwd, int) ;
+  reportedQueries (aMatch, minCopyN50, copyN50, libIndex) ;
   if (repFileName)
     { Gdb *gdb = gdbFromBuilder (gb) ;
       gdbMakeChromosomes (gdb) ;
-      writeRep (repFileName, schema, gdb, queryFileName, aQuery, aCluster, aSorted) ;
+      writeRep (repFileName, schema, gdb, queryFileName, aQuery, aCluster, aSorted, libIndex) ;
       gdbDestroy (gdb) ;
     }
   if (tsvFile || bedFile)
@@ -1310,7 +1355,7 @@ int main (int argc, char *argv[])
 	}
     }
   else if (!repFileName)
-    writeRep ("-", schema, 0, queryFileName, aQuery, aCluster, aSorted) ;
+    writeRep ("-", schema, 0, queryFileName, aQuery, aCluster, aSorted, libIndex) ;
   // per unit, both strands together: matches, clusters, bases, exact matches, and bases scanned with each scheme
   U64 *uMatch = new0 (nQueryFwd, U64), *uLen = new0 (nQueryFwd, U64), *uCount = new0 (nQueryFwd, U64) ;
   U64 *uScheme = new0 (nQueryFwd*MAX_SCHEME, U64) ;
@@ -1339,18 +1384,20 @@ int main (int argc, char *argv[])
     { U64 nExcluded = 0 ;
       for (int t = 0 ; t < nThread ; ++t)
 	nExcluded += worker[t]->nExcludedQuery[u] + worker[t]->nExcludedQuery[u+nQueryFwd] ;
-      fprintf (stderr, "%s: %llu matches in %llu clusters (%llu of more than one), %llu bp, identity %.1f%%, %llu excluded as overlapping",
+      fprintf (stderr, "%s: %llu matches in %llu clusters (%llu of more than one), %llu bp, identity %.1f%%, copy N50 %d, %llu excluded as overlapping",
 	       arrp(aQuery, u, Query)->name, uMatch[u], uCluster[u], uMulti[u], uLen[u],
-	       uLen[u] ? 100.0 * uCount[u] / uLen[u] : 0.0, nExcluded) ;
+	       uLen[u] ? 100.0 * uCount[u] / uLen[u] : 0.0, copyN50[u], nExcluded) ;
       if (scan.nScheme > 1 && uLen[u])
 	fprintf (stderr, ", bases scanned weak %.1f%% medium %.1f%% strong %.1f%%",
 		 100.0 * uScheme[u*MAX_SCHEME] / uLen[u], 100.0 * uScheme[u*MAX_SCHEME+1] / uLen[u],
 		 100.0 * uScheme[u*MAX_SCHEME+2] / uLen[u]) ;
+      if (!libIndex[u] && (repFileName || !(tsvFile || bedFile))) fprintf (stderr, " [not in the .1rep]") ;
       fputc ('\n', stderr) ;
     }
   newFree (uMatch, nQueryFwd, U64) ; newFree (uLen, nQueryFwd, U64) ; newFree (uCount, nQueryFwd, U64) ;
   newFree (uScheme, nQueryFwd*MAX_SCHEME, U64) ;
   newFree (uCluster, nQueryFwd, U64) ; newFree (uMulti, nQueryFwd, U64) ;
+  newFree (copyN50, nQueryFwd, int) ; newFree (libIndex, nQueryFwd, int) ;
   arrayDestroy (aCluster) ; arrayDestroy (aSorted) ;
   timeTotal(stderr) ;
 
