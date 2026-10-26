@@ -5,7 +5,7 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 25 23:41 2026 (claude)
+ * Last edited: Oct 26 02:52 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -86,7 +86,7 @@ typedef struct {
   int   isRC ;
   int   index ;     // 1-based position of the entry in the query file, counting any that were skipped
   char *name ;      // shared between a forward query and its reverse complement
-  char *type ;      // the Y type from a .1lib file, or 0 meaning "tandem"; shared like name
+  char *type ;      // the Y type from a .1lib file, or 0 meaning "Satellite"; shared like name
   char *seq ;
   I64   startScore[MAX_SCHEME][32][4] ;
   I64   endScore[MAX_SCHEME][32][4] ;
@@ -1009,7 +1009,7 @@ static void writeRep (char *fileName, OneSchema *schema, Gdb *gdb, char *queryFi
       oneWriteLine (of, 'l', 0, 0) ;
       for (int j = 0 ; j < nQueryFwd ; ++j)
 	{ Query *q = arrp(aQuery, j, Query) ;
-	  char *type = q->type ? q->type : "tandem" ;
+	  char *type = q->type ? q->type : "Satellite" ;
 	  oneInt(of,1) = q->len ;
 	  oneWriteLine (of, 'I', strlen(q->name), q->name) ;
 	  oneWriteLine (of, 'Y', strlen(type), type) ;
@@ -1160,7 +1160,7 @@ int main (int argc, char *argv[])
     { oneGoto (of, 'S', 1) ; oneReadLine (of) ; // start at first sequence
       while (of->lineType == 'S')
 	{ Query *q = arrayp (aQuery, arrayMax(aQuery), Query) ;
-	  bool isTandem = true ;
+	  bool isSatellite = true ;
 	  q->index = ++nEntry ;
 	  q->len = oneLen(of) ;
 	  q->seq = new (q->len, char) ;
@@ -1170,12 +1170,12 @@ int main (int argc, char *argv[])
 	    if (of->lineType == 'I' && !q->name)
 	      { q->name = new (oneLen(of)+1, char) ; strcpy (q->name, oneString(of)) ; }
 	    else if (of->lineType == 'Y' && !q->type)
-	      { if (strncmp (oneString(of), "tandem", 6)) isTandem = false ;
+	      { if (strncmp (oneString(of), "Satellite", 9)) isSatellite = false ;
 		q->type = new (oneLen(of)+1, char) ; strcpy (q->type, oneString(of)) ;
 	      }
-	  if (isTandem)
+	  if (isSatellite)
 	    { if (!q->name)
-		{ char buf[32] ; sprintf (buf, "tandem-%d", nEntry) ;
+		{ char buf[32] ; sprintf (buf, "Satellite-%d", nEntry) ;
 		  q->name = new (strlen(buf)+1, char) ; strcpy (q->name, buf) ;
 		}
 	    }
@@ -1215,7 +1215,7 @@ int main (int argc, char *argv[])
   char *queryFileName = *argv ;
   --argc ; ++argv ;
   fprintf (stderr, "read in %d query sequences, total length %llu bp", nQuery, totSat) ;
-  if (nSkip) fprintf (stderr, ", skipping %d whose type is not tandem", nSkip) ;
+  if (nSkip) fprintf (stderr, ", skipping %d whose type is not Satellite", nSkip) ;
   fprintf (stderr, "\n") ;
 
   SeqIO *sio ;

@@ -13,15 +13,15 @@
  *   - satmatch(): main alignment routine
  *
  * HISTORY:
- * Last edited: Oct 26 02:37 2026 (claude)
+ * Last edited: Oct 26 02:52 2026 (claude)
  * Created: Tue Aug 11 08:32:53 2026 (rd109)
  *-------------------------------------------------------------------
  */
 
-#include "utils.h"
+#include "alntools.h" // for VERSION
+#include "onerep.h"   // for the .1lib schema
 #include "array.h"
 #include "seqio.h"
-#include "ONElib.h"
 #include <string.h>
 #include <pthread.h>
 
@@ -408,6 +408,8 @@ int main (int argc, char *argv[])
     "  then clusters whose representatives match are merged, by single linkage.\n"
     "  Options:\n"
     "    -fa <file_name>         write the representative of each cluster to this fasta file\n"
+    "    -1 <file_name>          write the representative of each cluster of more than one sequence to\n"
+    "                            this binary ONEcode .1lib file, with type (Y) Satellite\n"
     "    -sf <file_name>         write the score of each pair of sequences to this tab-separated file,\n"
     "                            only with -allPairs\n"
     "    -ti <n>                 transition penalty [1]\n"
@@ -420,6 +422,7 @@ int main (int argc, char *argv[])
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
   FILE *scoreFile = 0, *fastaFile = 0 ;
+  char *libFileName = 0, *seqFileName = 0 ;
   ScoreParams scoreParams = {1,2,3} ;
   int nRandom = 0, lenRandom = 0 ;
   int minSeqLen = 0 ;
@@ -467,6 +470,8 @@ int main (int argc, char *argv[])
 	  lenRandom = atoi (*++argv) ;
 	  argc -= 2 ;
 	}
+      else if (!strcmp (*argv, "-1") && argc > 2)
+	{ libFileName = *++argv ; argc-- ; }
       else if (!strcmp (*argv, "-fa") && argc > 2)
 	{ fastaFile = fopen (*++argv, "w") ;
 	  if (!fastaFile) die ("failed to open fasta file %s to write", *--argv) ;
@@ -486,7 +491,8 @@ int main (int argc, char *argv[])
       totSeq = nRandom * lenRandom ;
     }
   else
-    { SeqIO *sio = seqIOopenRead (*argv, dna2index4Conv, "r") ;
+    { seqFileName = *argv ;
+      SeqIO *sio = seqIOopenRead (*argv, dna2index4Conv, "r") ;
       if (!sio) die ("failed to open sequence file %s", *argv) ;
       aSeq = arrayCreate (256, Seq) ;
       while (seqIOread (sio))
@@ -593,9 +599,30 @@ int main (int argc, char *argv[])
 	array(member[cluster[i]], arrayMax(member[cluster[i]]), int) = i ;
       }
 
+  OneFile *ofLib = 0 ;
+  OneSchema *schema = 0 ;
+  char *libSeq = 0 ; int libSeqMax = 0 ;
+  if (libFileName)
+    { schema = oneSchemaCreateFromText (repeatSchemaText) ;
+      if (!(ofLib = oneFileOpenWriteNew (libFileName, schema, "lib", true, 1)))
+	die ("failed to open .1lib file %s to write", libFileName) ;
+      oneAddProvenance (ofLib, "satmatch", VERSION, getCommandLine()) ;
+      if (!nRandom) oneAddReference (ofLib, seqFileName, 1) ;
+    }
   for (int k = 1 ; k <= nCluster ; ++k)
     { if (!member[k]) continue ;
       Seq *s = arrp(aSeq, rep[k], Seq) ;
+      if (ofLib && arrayMax(member[k]) > 1)
+	{ if (s->len > libSeqMax)
+	    { if (libSeq) newFree (libSeq, libSeqMax, char) ;
+	      libSeqMax = s->len ; libSeq = new (libSeqMax, char) ;
+	    }
+	  for (int i = 0 ; i < s->len ; ++i) libSeq[i] = index2char[s->seq[i]] ;
+	  oneWriteLine (ofLib, 'S', s->len, libSeq) ;
+	  char id[64] ; sprintf (id, "sat-%d-%d", k, s->len) ; // as in the -fa file
+	  oneWriteLine (ofLib, 'I', strlen(id), id) ;
+	  oneWriteLine (ofLib, 'Y', 9, "Satellite") ;
+	}
       printf ("cluster %d count %d minLen %d repLen %d ", k, (int)arrayMax(member[k]), minLen[k], s->len) ;
       for (int i = 0 ; i < s->len ; ++i) putchar (index2char[s->seq[i]]) ;
       putchar ('\n') ;
@@ -616,6 +643,8 @@ int main (int argc, char *argv[])
   newFree (repScore, nSeq, int) ;
   newFree (cluster, nSeq, int) ;
   if (scoreij) newFree (scoreij, (size_t)nSeq*nSeq, int) ;
+  if (ofLib) { oneFileClose (ofLib) ; oneSchemaDestroy (schema) ; } // close writes the footer
+  if (libSeq) newFree (libSeq, libSeqMax, char) ;
   if (fastaFile) fclose (fastaFile) ;
   if (scoreFile) fclose (scoreFile) ;
   seqArrayDestroy (aSeq) ;
