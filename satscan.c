@@ -5,12 +5,13 @@
  * Description: statellite scanning package
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 26 02:52 2026 (claude)
+ * Last edited: Oct 26 17:43 2026 (claude)
  * Created: Sun Aug 16 14:02:47 2026 (rd109)
  *-------------------------------------------------------------------
  */
 
 #include "onerep.h"
+#include "satscore.h" // the weak, medium and strong schemes, MAX_SCHEME and DANGER_T
 #include "alntools.h"
 #include "array.h"  // contains utils.h
 #include "seqio.h"
@@ -25,8 +26,6 @@
 // comparing packed values compares scores first and then prefers more exact matches.
 // NB the match count would carry into the score at 2^32 exact matches in one alignment.
 #define ONE ((I64)1 << 32)
-
-#define MAX_SCHEME 3	// the default schemes, weak, medium and strong, described below
 
 // The copy parse (approach A'): every DP cell carries the index of the CopyNode for the start of
 // the copy of the unit that its path is in. A new node is made each time a path wraps round from the
@@ -65,21 +64,13 @@ typedef struct {
   I64 gapExtend ;       /* gap extend per position, times ONE */
 } ScoreParams ;
 
-// By default three scoring schemes of increasing strictness are used. For each query strand and each
-// region of the target, satscan uses the least strict scheme under which chance matches are unlikely
-// there, judged from base composition (see dangerLevels()). A scheme given with -score is used
-// everywhere instead. The schemes share the match score, so scores, -smin and the x-drop are comparable.
-static ScoreParams defaultScheme[MAX_SCHEME] = {
-  { 2, -1, -3, -15*ONE, -1*ONE },	// weak
-  { 2, -2, -4, -20*ONE, -2*ONE },	// medium
-  { 2, -3, -6, -25*ONE, -2*ONE } } ;	// strong
+// By default the three scoring schemes of increasing strictness in satscore.c are used. For each query
+// strand and each region of the target, satscan uses the least strict scheme under which chance matches
+// are unlikely there, judged from base composition (see dangerLevels()): a region is dangerous for a query
+// strand and scheme if the expected ungapped score per aligned base of the query against random sequence
+// of the region's composition is above DANGER_T. A scheme given with -score is used everywhere instead.
+// The schemes share the match score, so scores, -smin and the x-drop are comparable.
 static char schemeChar[MAX_SCHEME] = { 'w', 'm', 's' } ; // for the output; a -score scheme is 'u'
-
-// A region is dangerous for a query strand and scheme if the expected ungapped score per aligned base
-// of the query against random sequence of the region's composition is above DANGER_T (score units).
-// Where it is at or below DANGER_T, simulations showed the gapped drift through random sequence stays
-// below about -0.20 per base in match units for all three schemes (see satscan-scoring.md).
-#define DANGER_T (-1)
 
 typedef struct {
   int   len ;
@@ -1145,7 +1136,12 @@ int main (int argc, char *argv[])
   scan.isAllowOverlaps = isAllowOverlaps ;
   for (int k = 0 ; k < scan.nScheme ; ++k)
     { ScoreParams *sp = &scan.sp[k] ;
-      *sp = isUserScheme ? userScheme : defaultScheme[k] ;
+      if (isUserScheme) *sp = userScheme ;
+      else
+	{ const SatScheme *ss = &satScheme[k] ;
+	  sp->match = ss->match ; sp->transition = ss->transition ; sp->transversion = ss->transversion ;
+	  sp->gapOpen = (I64)ss->gapOpen * ONE ; sp->gapExtend = (I64)ss->gapExtend * ONE ;
+	}
       for (int i = 4 ; i-- ;) for (int j = 4 ; j-- ;) baseScore[k][i][j] = (I64)sp->transversion * ONE ;
       baseScore[k][0][0] = baseScore[k][1][1] = baseScore[k][2][2] = baseScore[k][3][3] = (I64)sp->match * ONE + 1 ;
       baseScore[k][0][2] = baseScore[k][2][0] = baseScore[k][1][3] = baseScore[k][3][1] = (I64)sp->transition * ONE ;

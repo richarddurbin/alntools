@@ -32,7 +32,8 @@ tancons.o: alntools.h ONElib.h $(UTILS_HEADERS)
 
 gdb.o: alntools.h ONElib.h seqio.h $(UTILS_HEADERS)
 
-satscan.o: onerep.h alntools.h seqio.h ONElib.h $(UTILS_HEADERS)
+satscan.o: onerep.h alntools.h satscore.h seqio.h ONElib.h $(UTILS_HEADERS)
+satscore.o: satscore.h $(UTILS_HEADERS)
 
 SEQIO_OPTS = -DONEIO
 seqio.o: seqio.c seqio.h ONElib.h $(UTILS_HEADERS)
@@ -59,10 +60,10 @@ taco: taco.c gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 svfind: svfind.c alnseq.o alncode.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-satmatch: satmatch.c seqio.o ONElib.o $(UTILS_OBJS)
+satmatch: satmatch.c satscore.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-satscan: satscan.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
+satscan: satscan.o satscore.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 ONEview: ONEview.c ONElib.o
