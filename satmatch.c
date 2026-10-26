@@ -13,13 +13,14 @@
  *   - satmatch(): main alignment routine
  *
  * HISTORY:
- * Last edited: Oct 26 02:52 2026 (claude)
+ * Last edited: Oct 26 17:43 2026 (claude)
  * Created: Tue Aug 11 08:32:53 2026 (rd109)
  *-------------------------------------------------------------------
  */
 
 #include "alntools.h" // for VERSION
 #include "onerep.h"   // for the .1lib schema
+#include "satscore.h" // satscan's scoring, used to link representatives
 #include "array.h"
 #include "seqio.h"
 #include <string.h>
@@ -30,6 +31,7 @@ typedef struct {
   char *name ;
   char *seq ;
   char *rSeq ;
+  int   level ;	// the least strict satscan scheme safe for its composition, MAX_SCHEME if none is
 } Seq ;
 
 typedef struct {
@@ -96,6 +98,116 @@ int needlemanWunsch (Seq *s1, Seq *s2, ScoreParams *sp, int threshold, int *jMax
   return score ;
 }
 
+// Single-cycle alignment, used by the greedy clustering: the best cost of aligning all of the shorter
+// sequence S against exactly one cycle of the longer one R, starting at any rotation of R, so with no
+// multiple copies. R is on the columns, as a circle, and S on the rows. Each cell holds the cost in its upper
+// 32 bits and, in its lower 32 bits, the column of R at which its least-cost path started, carried along by
+// taking the minimum of the packed values. On the last row, a cell whose start is the column after it has
+// gone exactly once round R, so its cost is that of a real single-cycle alignment: the least of these is an
+// upper bound UB on the best. The least cost of the whole row, ending anywhere, is a lower bound LB, as the
+// paths it allows include all single-cycle ones. So if LB > threshold the pair cannot link, and if
+// UB <= threshold it can. Otherwise, rarely, R is aligned globally from each of the starts of the cheapest
+// last-row cells. All costs are non-negative, so once a row's least cost is above threshold the alignment
+// stops, returning it, a bound above threshold.
+
+#define NTRY 16 // the most last-row cells whose starts are tried when the bounds leave a pair undecided
+typedef struct { I64 aligned, ambiguous, resolved ; } CyclicStats ; // counts of alignments, kept atomically
+static CyclicStats cyclicStats ;
+
+static void costTable (ScoreParams *sp, int cost[4][4])
+{
+  for (int i = 0 ; i < 4 ; i++) for (int j = 0 ; j < 4 ; j++) cost[i][j] = sp->transversion ;
+  cost[0][0] = cost[1][1] = cost[2][2] = cost[3][3] = 0 ;
+  cost[0][2] = cost[2][0] = cost[1][3] = cost[3][1] = sp->transition ;
+}
+
+// an ordinary global alignment of all of S against all of R, starting at column start of R
+static int rotatedCost (char *s, int n, char *r, int L, int start, ScoreParams *sp, int threshold)
+{
+  int cost[4][4] ; costTable (sp, cost) ;
+  int *prev = new (L+1, int), *cur = new (L+1, int) ;
+  for (int j = 0 ; j <= L ; ++j) prev[j] = j * sp->gap ;
+  int result = 0 ;
+  for (int i = 0 ; i < n ; ++i)
+    { cur[0] = (i+1) * sp->gap ;
+      int rowMin = cur[0] ;
+      for (int j = 1, k = start ; j <= L ; ++j, k = (k+1 == L) ? 0 : k+1)
+	{ int d = prev[j-1] + cost[(int)s[i]][(int)r[k]], g = sp->gap + min (prev[j], cur[j-1]) ;
+	  cur[j] = min (d, g) ;
+	  if (cur[j] < rowMin) rowMin = cur[j] ;
+	}
+      int *t = prev ; prev = cur ; cur = t ;
+      if (rowMin > threshold) { result = rowMin ; break ; }
+      result = prev[L] ;
+    }
+  newFree (prev, L+1, int) ; newFree (cur, L+1, int) ;
+  return result ;
+}
+
+static int cyclicCost (Seq *a, Seq *b, ScoreParams *sp, int threshold)
+{
+  Seq *rs = a->len >= b->len ? a : b, *ss = a->len >= b->len ? b : a ;
+  char *r = rs->seq, *s = ss->seq ;
+  int L = rs->len, n = ss->len ;
+  int cost[4][4] ; costTable (sp, cost) ;
+  I64 G = (I64)sp->gap << 32 ;
+  I64 *prev = new (L, I64), *cur = new (L, I64) ;
+  for (int j = 0 ; j < L ; ++j) prev[j] = (j+1 == L) ? 0 : j+1 ; // cost 0, starting at the next column
+  __atomic_fetch_add (&cyclicStats.aligned, 1, __ATOMIC_RELAXED) ;
+  for (int i = 0 ; i < n ; ++i)
+    { int c = s[i] ;
+      I64 rowMin ;
+      for (int j = 0 ; j < L ; ++j) // diagonal from column j-1, and a gap in R (S[i] alone) from above
+	{ I64 d = prev[j ? j-1 : L-1] + ((I64)cost[c][(int)r[j]] << 32), v = prev[j] + G ;
+	  cur[j] = d < v ? d : v ;
+	}
+      // gaps in S along the row (R[j] alone), round the circle: a first pass from column 0, entering from
+      // column L-1, then on round while it still improves cells
+      I64 h = cur[L-1] + G ;
+      for (int j = 0 ; j < L ; ++j) { if (h < cur[j]) cur[j] = h ; h = cur[j] + G ; }
+      for (int j = 0 ; j < L && h < cur[j] ; ++j) { cur[j] = h ; h += G ; }
+      rowMin = cur[0] ;
+      for (int j = 1 ; j < L ; ++j) if (cur[j] < rowMin) rowMin = cur[j] ;
+      I64 *t = prev ; prev = cur ; cur = t ;
+      if ((rowMin >> 32) > threshold) // LB > threshold: no alignment can now end at or below it
+	{ newFree (prev, L, I64) ; newFree (cur, L, I64) ;
+	  return rowMin >> 32 ;
+	}
+    }
+  int lb = NO_THRESHOLD, ub = NO_THRESHOLD ;
+  for (int j = 0 ; j < L ; ++j)
+    { int c = prev[j] >> 32, start = prev[j] & 0xffffffff ;
+      if (c < lb) lb = c ;
+      if (start == ((j+1 == L) ? 0 : j+1) && c < ub) ub = c ; // went exactly once round R
+    }
+  int result = ub ;
+  if (lb <= threshold && ub > threshold) // undecided: align from the starts suggested by the cheapest cells
+    { __atomic_fetch_add (&cyclicStats.ambiguous, 1, __ATOMIC_RELAXED) ;
+      // Paths from neighbouring starts merge within a few rows, so a cell often holds a neighbour's start.
+      // For each of the cheapest cells, at column j, in order, try the start j+1 that would complete a cycle
+      // there, and the start it holds, until the pair links or the cells are above threshold: the cost of a
+      // cycle ending at a cell is at least the cell's.
+      int tried[2*NTRY], nTried = 0 ;
+      for (int k = 0 ; k < NTRY && result > threshold ; ++k)
+	{ int bj = -1 ; // the cheapest cell not yet used
+	  for (int j = 0 ; j < L ; ++j) if ((prev[j] >> 32) < NO_THRESHOLD && (bj < 0 || prev[j] < prev[bj])) bj = j ;
+	  if (bj < 0 || (prev[bj] >> 32) > threshold) break ;
+	  int starts[2] = { (bj+1) % L, prev[bj] & 0xffffffff } ;
+	  prev[bj] = (I64)NO_THRESHOLD << 32 ; // used
+	  for (int q = 0 ; q < 2 && result > threshold ; ++q)
+	    { int t ; for (t = 0 ; t < nTried ; ++t) if (tried[t] == starts[q]) break ;
+	      if (t < nTried) continue ;
+	      tried[nTried++] = starts[q] ;
+	      int x = rotatedCost (s, n, r, L, starts[q], sp, threshold) ;
+	      if (x < result) result = x ;
+	    }
+	}
+      if (result <= threshold) __atomic_fetch_add (&cyclicStats.resolved, 1, __ATOMIC_RELAXED) ;
+    }
+  newFree (prev, L, I64) ; newFree (cur, L, I64) ;
+  return result ;
+}
+
 Array randomSeqs (int n, int len)
 {
   Array a = arrayCreate (n, Seq) ;
@@ -104,6 +216,8 @@ Array randomSeqs (int n, int len)
       s->len = len ;
       s->name = new(32,char) ; sprintf (s->name, "random%d-%d", len, i+1) ;
       s->seq = new (s->len, char) ; for (int j = 0 ; j < len ; ++j) s->seq[j] = rand()&0x3 ;
+      s->rSeq = seqRevComp (s->seq, s->len) ;
+      s->level = satSchemeLevel (s->seq, s->len) ;
     }
   return a ;
 }
@@ -135,6 +249,16 @@ static int pairScore (Array aSeq, ScoreParams *sp, int i, int j, int threshold, 
   int score1 = needlemanWunsch (si, sj, sp, threshold, &jMax1) ;
   int score2 = needlemanWunsch (si, &sjRC, sp, min (threshold, score1), &jMax2) ;
   if (offset) *offset = (score1 <= score2) ? jMax1 : -(jMax2+1) ;
+  return min (score1, score2) ;
+}
+
+// the better single-cycle cost of i against j in either orientation, or a bound above threshold
+static int cyclicPairScore (Array aSeq, ScoreParams *sp, int i, int j, int threshold)
+{
+  Seq *si = arrp(aSeq,i,Seq), *sj = arrp(aSeq,j,Seq) ;
+  Seq sjRC = *sj ; sjRC.seq = sj->rSeq ;
+  int score1 = cyclicCost (si, sj, sp, threshold) ;
+  int score2 = cyclicCost (si, &sjRC, sp, min (threshold, score1)) ;
   return min (score1, score2) ;
 }
 
@@ -170,8 +294,24 @@ static void runThreads (void *(*f)(void*), void *arg, int nThread)
 }
 
 // a list of pairs to score in parallel, each with i < j as in the all-pairs scoring; only pairs whose
-// score is -1 are scored, each with its own threshold
-typedef struct { int i, j, threshold, score, offset ; } Pair ;
+// score is UNSCORED are scored, each with its own threshold: with satscan's scheme level if level >= 0,
+// by satPairScore(), else with satmatch's costs, by single-cycle alignment if level is CYCLIC, else
+// with the shorter sequence wrapping round any number of times
+#define UNSCORED (-(1 << 30))
+#define CYCLIC (-2)
+typedef struct { int i, j, threshold, score, offset, level ; } Pair ;
+
+// the best satscan score of a global alignment of the longer of i and j against the shorter as a circle,
+// in either orientation, using scheme level; a bound at most threshold if it cannot be above threshold
+static int satPairScore (Array aSeq, int i, int j, int level, int threshold)
+{
+  Seq *t = arrp(aSeq,i,Seq), *q = arrp(aSeq,j,Seq) ;
+  if (q->len > t->len) { Seq *x = t ; t = q ; q = x ; }
+  const SatScheme *sp = &satScheme[level] ;
+  int score1 = satGlobalScore (t->seq, t->len, q->seq, q->len, sp, threshold) ;
+  int score2 = satGlobalScore (t->seq, t->len, q->rSeq, q->len, sp, score1 > threshold ? score1 : threshold) ;
+  return score1 > score2 ? score1 : score2 ;
+}
 
 typedef struct {
   Array aSeq ;
@@ -192,7 +332,10 @@ static void *pairListThread (void *arg)
       if (k0 >= pl->nPair) break ;
       for (I64 k = k0 ; k < k0 + CHUNK && k < pl->nPair ; ++k)
 	{ Pair *p = &pl->pair[k] ;
-	  if (p->score < 0) p->score = pairScore (pl->aSeq, pl->sp, p->i, p->j, p->threshold, &p->offset) ;
+	  if (p->score == UNSCORED)
+	    p->score = p->level >= 0 ? satPairScore (pl->aSeq, p->i, p->j, p->level, p->threshold)
+	      : p->level == CYCLIC ? cyclicPairScore (pl->aSeq, pl->sp, p->i, p->j, p->threshold)
+	      : pairScore (pl->aSeq, pl->sp, p->i, p->j, p->threshold, &p->offset) ;
 	}
     }
   return 0 ;
@@ -209,8 +352,20 @@ static void scorePairs (Array aSeq, ScoreParams *sp, Array aPair, int nThread)
 static inline Pair *addPair (Array aPair, int i, int j, int threshold)
 { Pair *p = arrayp(aPair, arrayMax(aPair), Pair) ;
   if (i < j) { p->i = i ; p->j = j ; } else { p->i = j ; p->j = i ; }
-  p->threshold = threshold ; p->score = -1 ; p->offset = 0 ;
+  p->threshold = threshold ; p->score = UNSCORED ; p->offset = 0 ; p->level = -1 ;
   return p ;
+}
+
+// A pair for the greedy clustering, scored by single-cycle alignment unless its lengths alone show that it
+// cannot link: every alignment has at least |lengthDifference| gap positions, and all costs are
+// non-negative, so its cost is at least gap * |lengthDifference|.
+static I64 nLengthReject = 0 ;
+static void greedyPair (Array aSeq, ScoreParams *sp, Array aPair, int i, int j, int threshold)
+{
+  Pair *p = addPair (aPair, i, j, threshold) ;
+  int bound = sp->gap * abs (arrp(aSeq,i,Seq)->len - arrp(aSeq,j,Seq)->len) ;
+  if (bound > threshold) { p->score = bound ; ++nLengthReject ; } // not aligned
+  else p->level = CYCLIC ;
 }
 
 static Array lengthOrderSeqs ; // for lengthOrder(), which sorts sequence indices by length, then index
@@ -221,7 +376,8 @@ static int lengthOrder (const void *a, const void *b)
 }
 
 // Greedy clustering: the sequences are taken from shortest to longest, and each joins the
-// cluster of the representative it scores best against, if that is within the threshold for its length,
+// cluster of the representative it scores best against by single-cycle alignment, cyclicCost(), if that
+// is within the threshold for its length,
 // else becomes the representative of a new cluster. So each representative is the shortest member of its
 // cluster. To use threads, a batch of sequences is scored against all the representatives found before
 // the batch and against all the earlier sequences in the batch, and the batch is then resolved in order,
@@ -243,8 +399,8 @@ static int clusterGreedy (Array aSeq, ScoreParams *sp, double threshFac, int nTh
       for (int k = b0 ; k < b1 ; ++k)
 	{ Seq *s = arrp(aSeq,order[k],Seq) ;
 	  int threshold = threshFac * s->len - 10 ; // s is at least as long as any representative
-	  for (int r = 0 ; r < nRep0 ; ++r) addPair (aPair, order[k], arr(aRep,r,int), threshold) ;
-	  for (int k2 = b0 ; k2 < k ; ++k2) addPair (aPair, order[k], order[k2], threshold) ;
+	  for (int r = 0 ; r < nRep0 ; ++r) greedyPair (aSeq, sp, aPair, order[k], arr(aRep,r,int), threshold) ;
+	  for (int k2 = b0 ; k2 < k ; ++k2) greedyPair (aSeq, sp, aPair, order[k], order[k2], threshold) ;
 	}
       scorePairs (aSeq, sp, aPair, nThread) ;
       Pair *p = arrp(aPair,0,Pair) ;
@@ -272,7 +428,9 @@ static int clusterGreedy (Array aSeq, ScoreParams *sp, double threshFac, int nTh
 	}
     }
   int nCluster = arrayMax(aRep) ;
-  fprintf (stderr, "greedy clustering: %d clusters\t", nCluster) ; timeUpdate (stderr) ;
+  fprintf (stderr, "greedy clustering: %d clusters; %lld pairs rejected by length, %lld alignments, %lld undecided by bounds of which %lld linked by rotated alignment\t",
+	   nCluster, (long long)nLengthReject, (long long)cyclicStats.aligned, (long long)cyclicStats.ambiguous, (long long)cyclicStats.resolved) ;
+  timeUpdate (stderr) ;
 
   arrayDestroy (aPair) ; arrayDestroy (aRep) ; newFree (order, nSeq, int) ;
   return nCluster ;
@@ -342,9 +500,12 @@ static void chooseRepresentatives (Array aSeq, ScoreParams *sp, int nThread, int
 }
 
 // Single linkage of the clusters over all pairs of their representatives, in cluster order, keeping the
-// lower cluster number, so that e.g. subfamilies of a satellite are joined, as by -allPairs. Sets isMerged[k]
-// for each cluster k that others are merged into, and returns the number of merges.
-static int linkRepresentatives (Array aSeq, ScoreParams *sp, double threshFac, int nThread,
+// lower cluster number, so that e.g. subfamilies of a satellite are joined. Pairs are scored as satscan
+// would, more sensitively than by satmatch's costs: a global alignment of the longer representative against
+// the shorter as a circle, with the stricter of the two schemes safe for their compositions, and are linked
+// if the score is above minScore. Representatives safe for no scheme are not linked. Sets isMerged[k] for
+// each cluster k that others are merged into, and returns the number of merges.
+static int linkRepresentatives (Array aSeq, ScoreParams *sp, int minScore, int nThread,
 				int *cluster, int nCluster, int *rep, bool *isMerged)
 {
   int nSeq = arrayMax(aSeq) ;
@@ -357,7 +518,10 @@ static int linkRepresentatives (Array aSeq, ScoreParams *sp, double threshFac, i
   for (int a = 0 ; a < nK ; ++a)
     for (int b = a+1 ; b < nK ; ++b)
       { int i = rep[arr(aK,a,int)], j = rep[arr(aK,b,int)] ;
-	addPair (aPair, i, j, pairThreshold (threshFac, arrp(aSeq,i,Seq), arrp(aSeq,j,Seq))) ;
+	int li = arrp(aSeq,i,Seq)->level, lj = arrp(aSeq,j,Seq)->level ;
+	Pair *p = addPair (aPair, i, j, minScore) ;
+	if (li == MAX_SCHEME || lj == MAX_SCHEME) p->score = minScore ; // not linked, and not aligned
+	else p->level = li > lj ? li : lj ;
       }
   scorePairs (aSeq, sp, aPair, nThread) ;
   int *map = new (nCluster+1, int) ; // the cluster each cluster is merged into
@@ -367,11 +531,11 @@ static int linkRepresentatives (Array aSeq, ScoreParams *sp, double threshFac, i
   for (int a = 0 ; a < nK ; ++a)
     for (int b = a+1 ; b < nK ; ++b, ++p)
       { int ka = arr(aK,a,int), kb = arr(aK,b,int) ;
-	if (p->score <= p->threshold && map[ka] != map[kb])
+	if (p->score > minScore && map[ka] != map[kb])
 	  { int to = min (map[ka], map[kb]), from = map[ka] + map[kb] - to ;
-	    printf ("  merge cluster %d to %d via representatives %d (%d) and %d (%d) score %d thresh %d\n",
+	    printf ("  merge cluster %d to %d via representatives %d (%d) and %d (%d) score %d scheme %c minScore %d\n",
 		    from, to, rep[ka], arrp(aSeq,rep[ka],Seq)->len, rep[kb], arrp(aSeq,rep[kb],Seq)->len,
-		    p->score, p->threshold) ;
+		    p->score, satSchemeChar[p->level], minScore) ;
 	    for (int k = 1 ; k <= nCluster ; ++k) if (map[k] == from) map[k] = to ;
 	    isMerged[to] = true ;
 	    ++nMerge ;
@@ -384,11 +548,44 @@ static int linkRepresentatives (Array aSeq, ScoreParams *sp, double threshFac, i
   return nMerge ;
 }
 
+// The number of copies of the unit in the array a sequence came from, as int(array length / unit length),
+// with the array read from a tancons name, cons<unit>#<seq>:<start>-<end>#<count>#<identity>; else 0.
+static int arrayCopies (Seq *s)
+{
+  char *a = strchr (s->name, '#') ;
+  if (!a || strncmp (s->name, "cons", 4)) return 0 ;
+  int unit = atoi (s->name + 4) ;
+  char *b = strchr (a+1, '#') ;
+  if (!b || unit <= 0) return 0 ;
+  char *c = b ; while (c > a && *c != ':') --c ; // the last ':' before the second '#', as seq may contain ':'
+  long long start, end ;
+  if (*c != ':' || sscanf (c+1, "%lld-%lld", &start, &end) != 2 || end <= start) return 0 ;
+  return (end - start) / unit ;
+}
+
+static int intDecreasing (const void *a, const void *b)
+{ int x = *(const int*)a, y = *(const int*)b ; return x > y ? -1 : x < y ; }
+
+// the N50 of the array copy numbers of the members of a cluster: the copy number at which the members
+// taken from the most copies down first include half of all their copies
+static int n50Copies (Array aSeq, Array members)
+{
+  int n = arrayMax(members), *c = new (n, int) ;
+  long long total = 0, sum = 0 ;
+  for (int a = 0 ; a < n ; ++a) total += (c[a] = arrayCopies (arrp(aSeq, arr(members,a,int), Seq))) ;
+  qsort (c, n, sizeof(int), intDecreasing) ;
+  int x = 0 ;
+  for (int a = 0 ; a < n && 2*sum < total ; ++a) { sum += c[a] ; x = c[a] ; }
+  newFree (c, n, int) ;
+  return x ;
+}
+
 void seqArrayDestroy (Array a)
 {
   for (int i = 0 ; i < arrayMax(a) ; ++i)
     { Seq *s = arrp(a,i,Seq) ;
       newFree (s->seq, s->len, char) ;
+      if (s->rSeq) newFree (s->rSeq, s->len, char) ;
       newFree (s->name, strlen(s->name)+1, char) ;
     }
   arrayDestroy (a) ;
@@ -405,7 +602,8 @@ int main (int argc, char *argv[])
     "  against the shorter one of the pair as a circle, which can wrap round any number of times, and\n"
     "  picks a representative for each cluster. By default sequences are taken from the shortest, and\n"
     "  each joins the cluster of the representative so far that it matches best, or starts a new one;\n"
-    "  then clusters whose representatives match are merged, by single linkage.\n"
+    "  then clusters whose representatives score above -minScore against each other, aligned globally with\n"
+    "  satscan's scoring, are merged by single linkage.\n"
     "  Options:\n"
     "    -fa <file_name>         write the representative of each cluster to this fasta file\n"
     "    -1 <file_name>          write the representative of each cluster of more than one sequence to\n"
@@ -418,6 +616,7 @@ int main (int argc, char *argv[])
     "    -minlen <n>             only use sequences at least this long [0]\n"
     "    -random <n> <len>       use n random sequences of length len instead of <seqfile>\n"
     "    -allPairs               cluster by single linkage over all pairs of sequences\n"
+    "    -minScore <n>           link representatives whose satscan score is above this [0]\n"
     "    -T <n>                  number of threads [8]\n" ;
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
@@ -427,6 +626,7 @@ int main (int argc, char *argv[])
   int nRandom = 0, lenRandom = 0 ;
   int minSeqLen = 0 ;
   int nThread = 8 ;
+  int minScore = 0 ;
   bool isAllPairs = false ;
 
   /* Process command line options */
@@ -458,6 +658,8 @@ int main (int argc, char *argv[])
           if (minSeqLen < 0) die ("bad minlen %s - must be non-negative\n%s", *argv, usage) ;
           argc-- ;
         }
+      else if (!strcmp (*argv, "-minScore") && argc > 1)
+        { minScore = atoi (*++argv) ; argc-- ; }
       else if (!strcmp (*argv, "-allPairs"))
 	isAllPairs = true ;
       else if (!strcmp (*argv, "-T") && argc > 1)
@@ -502,6 +704,7 @@ int main (int argc, char *argv[])
 	  s->name = strdup (sqioId(sio)) ;
 	  s->seq = new (s->len, char) ; memcpy (s->seq, sqioSeq(sio), s->len) ;
 	  s->rSeq = seqRevComp (s->seq, s->len) ;
+	  s->level = satSchemeLevel (s->seq, s->len) ;
 	  totSeq += s->len ;
 	}
       seqIOclose (sio) ;
@@ -587,7 +790,7 @@ int main (int argc, char *argv[])
 			 threshFac, minLen, rep, repScore) ;
   if (!isAllPairs) // link the clusters via their representatives, and choose again for merged ones
     { bool *isMerged = new0 (nCluster+1, bool) ;
-      if (linkRepresentatives (aSeq, &scoreParams, threshFac, nThread, cluster, nCluster, rep, isMerged))
+      if (linkRepresentatives (aSeq, &scoreParams, minScore, nThread, cluster, nCluster, rep, isMerged))
 	chooseRepresentatives (aSeq, &scoreParams, nThread, cluster, nCluster, isMerged, 0, false,
 			       threshFac, minLen, rep, repScore) ;
       newFree (isMerged, nCluster+1, bool) ;
@@ -599,6 +802,7 @@ int main (int argc, char *argv[])
 	array(member[cluster[i]], arrayMax(member[cluster[i]]), int) = i ;
       }
 
+  int nUnsafe = 0 ; // representatives safe for no scheme, left out of -fa and -1
   OneFile *ofLib = 0 ;
   OneSchema *schema = 0 ;
   char *libSeq = 0 ; int libSeqMax = 0 ;
@@ -612,22 +816,24 @@ int main (int argc, char *argv[])
   for (int k = 1 ; k <= nCluster ; ++k)
     { if (!member[k]) continue ;
       Seq *s = arrp(aSeq, rep[k], Seq) ;
-      if (ofLib && arrayMax(member[k]) > 1)
+      char id[64] ; sprintf (id, "sat-%d-%d-%d", k, s->len, n50Copies (aSeq, member[k])) ;
+      bool isSafe = s->level < MAX_SCHEME ; // else satscan would wall its own arrays off, so it is dropped
+      if (!isSafe) { fprintf (stderr, "%s%s", nUnsafe ? " " : "dropped as unsafe for every scheme: ", id) ; ++nUnsafe ; }
+      if (ofLib && isSafe && arrayMax(member[k]) > 1)
 	{ if (s->len > libSeqMax)
 	    { if (libSeq) newFree (libSeq, libSeqMax, char) ;
 	      libSeqMax = s->len ; libSeq = new (libSeqMax, char) ;
 	    }
 	  for (int i = 0 ; i < s->len ; ++i) libSeq[i] = index2char[s->seq[i]] ;
 	  oneWriteLine (ofLib, 'S', s->len, libSeq) ;
-	  char id[64] ; sprintf (id, "sat-%d-%d", k, s->len) ; // as in the -fa file
 	  oneWriteLine (ofLib, 'I', strlen(id), id) ;
 	  oneWriteLine (ofLib, 'Y', 9, "Satellite") ;
 	}
-      printf ("cluster %d count %d minLen %d repLen %d ", k, (int)arrayMax(member[k]), minLen[k], s->len) ;
+      printf ("cluster %d count %d minLen %d repLen %d name %s ", k, (int)arrayMax(member[k]), minLen[k], s->len, id) ;
       for (int i = 0 ; i < s->len ; ++i) putchar (index2char[s->seq[i]]) ;
       putchar ('\n') ;
-      if (fastaFile)
-	{ fprintf (fastaFile, ">sat-%d-%d\n", k, s->len) ;
+      if (fastaFile && isSafe)
+	{ fprintf (fastaFile, ">%s\n", id) ;
 	  for (int i = 0 ; i < s->len ; ++i) fputc (index2char[s->seq[i]], fastaFile) ;
 	  fputc ('\n', fastaFile) ;
 	}
@@ -643,6 +849,7 @@ int main (int argc, char *argv[])
   newFree (repScore, nSeq, int) ;
   newFree (cluster, nSeq, int) ;
   if (scoreij) newFree (scoreij, (size_t)nSeq*nSeq, int) ;
+  if (nUnsafe) fputc ('\n', stderr) ;
   if (ofLib) { oneFileClose (ofLib) ; oneSchemaDestroy (schema) ; } // close writes the footer
   if (libSeq) newFree (libSeq, libSeqMax, char) ;
   if (fastaFile) fclose (fastaFile) ;
