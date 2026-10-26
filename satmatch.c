@@ -13,7 +13,7 @@
  *   - satmatch(): main alignment routine
  *
  * HISTORY:
- * Last edited: Oct 26 01:32 2026 (claude)
+ * Last edited: Oct 26 02:37 2026 (claude)
  * Created: Tue Aug 11 08:32:53 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -40,7 +40,12 @@ typedef struct {
 
 static inline int min (int x, int y) { return x < y ? x : y ; }
 
-int needlemanWunsch (Seq *s1, Seq *s2, ScoreParams *sp, int *jMax)
+#define NO_THRESHOLD (1 << 30)
+
+// The best (lowest) cost of aligning all of the longer sequence against the shorter one as a circle. All
+// costs are non-negative, so the lowest cost in a row can only rise in later rows: once it is above
+// threshold the alignment stops, returning that lowest cost, a lower bound above threshold, not the score.
+int needlemanWunsch (Seq *s1, Seq *s2, ScoreParams *sp, int threshold, int *jMax)
 {
   if (s2->len > s1->len) { Seq *s = s1 ; s1 = s2 ; s2 = s ; } // swap
   int len1 = s1->len ;
@@ -64,15 +69,21 @@ int needlemanWunsch (Seq *s1, Seq *s2, ScoreParams *sp, int *jMax)
   for (i = 1 ; i <= len1 ; i++)
     { // s2 is circular: column 0 continues from the end of s2, so the shorter s2 can wrap many times
       row[0] = min (prev[len2-1]+cost[s1->seq[i-1]][s2->seq[len2-1]], sp->gap+prev[len2]) ;
+      int rowMin = row[0] ;
       // printf ("%c %2d", index2char[s1->seq[i-1]], row[0]) ;
       for (j = 1 ; j <= len2 ; j++)
         { int d = prev[j-1] + cost[s1->seq[i-1]][s2->seq[j-1]] ;  // diagonal: match/mismatch
           int g = sp->gap + min (prev[j], row[j-1]) ;             // up or left + gap
           row[j] = min (d, g) ;
+	  if (row[j] < rowMin) rowMin = row[j] ;
 	  // printf (" %2d", row[j]) ;
         }
       // putchar ('\n') ;
       int *tmp = prev ; prev = row ; row = tmp ; // swap rows
+      if (rowMin > threshold) // no alignment can now end at or below threshold
+	{ newFree (prev, len2+1, int) ; newFree (row, len2+1, int) ;
+	  return rowMin ;
+	}
     }
   
   int score = 3 * len1 ; // the best end, at any position in s2
@@ -105,20 +116,34 @@ typedef struct {
   int nSeq ;
   int *scoreij ;	// nSeq*nSeq: the better score of (i,j) over both orientations of j, for j > i
   int *offsetij ;	// if not 0, the end offset of that alignment, as -(offset+1) if j was reverse complemented
+  double threshFac ;	// if > 0, alignments stop once they cannot link, i.e. are above pairThreshold()
   int nextRow ;
   pthread_mutex_t lock ;
 } PairJob ;
 
-static void scorePair (PairJob *pj, int i, int j)
+// two sequences are linked if their score is at most this
+static inline int pairThreshold (double threshFac, Seq *a, Seq *b)
+{ return threshFac * (a->len < b->len ? b->len : a->len) - 10 ; }
+
+// the better score of i against j in either orientation, or a bound above threshold if both are above it;
+// *offset as for offsetij. The second orientation only needs to beat the first.
+static int pairScore (Array aSeq, ScoreParams *sp, int i, int j, int threshold, int *offset)
 {
-  Seq *si = arrp(pj->aSeq,i,Seq), *sj = arrp(pj->aSeq,j,Seq) ;
+  Seq *si = arrp(aSeq,i,Seq), *sj = arrp(aSeq,j,Seq) ;
   Seq sjRC = *sj ; sjRC.seq = sj->rSeq ; // so sj itself is never changed while other threads read it
   int jMax1 = 0, jMax2 = 0 ;
-  int score1 = needlemanWunsch (si, sj, pj->sp, &jMax1) ;
-  int score2 = needlemanWunsch (si, &sjRC, pj->sp, &jMax2) ;
+  int score1 = needlemanWunsch (si, sj, sp, threshold, &jMax1) ;
+  int score2 = needlemanWunsch (si, &sjRC, sp, min (threshold, score1), &jMax2) ;
+  if (offset) *offset = (score1 <= score2) ? jMax1 : -(jMax2+1) ;
+  return min (score1, score2) ;
+}
+
+static void scorePair (PairJob *pj, int i, int j)
+{
   size_t k = (size_t)i*pj->nSeq + j ;
-  pj->scoreij[k] = min (score1, score2) ;
-  if (pj->offsetij) pj->offsetij[k] = (score1 <= score2) ? jMax1 : -(jMax2+1) ;
+  int threshold = pj->threshFac > 0 ?
+    pairThreshold (pj->threshFac, arrp(pj->aSeq,i,Seq), arrp(pj->aSeq,j,Seq)) : NO_THRESHOLD ;
+  pj->scoreij[k] = pairScore (pj->aSeq, pj->sp, i, j, threshold, pj->offsetij ? &pj->offsetij[k] : 0) ;
 }
 
 static void *pairThread (void *arg)
@@ -132,6 +157,231 @@ static void *pairThread (void *arg)
       for (int j = i+1 ; j < pj->nSeq ; ++j) scorePair (pj, i, j) ;
     }
   return 0 ;
+}
+
+static void runThreads (void *(*f)(void*), void *arg, int nThread)
+{
+  if (nThread == 1) { f (arg) ; return ; }
+  pthread_t *thread = new (nThread, pthread_t) ;
+  for (int t = 0 ; t < nThread ; ++t)
+    if (pthread_create (&thread[t], 0, f, arg)) die ("failed to create thread %d", t) ;
+  for (int t = 0 ; t < nThread ; ++t) pthread_join (thread[t], 0) ;
+  newFree (thread, nThread, pthread_t) ;
+}
+
+// a list of pairs to score in parallel, each with i < j as in the all-pairs scoring; only pairs whose
+// score is -1 are scored, each with its own threshold
+typedef struct { int i, j, threshold, score, offset ; } Pair ;
+
+typedef struct {
+  Array aSeq ;
+  ScoreParams *sp ;
+  Pair *pair ;
+  I64 nPair, next ;
+  pthread_mutex_t lock ;
+} PairListJob ;
+
+static void *pairListThread (void *arg)
+{
+  PairListJob *pl = (PairListJob*) arg ;
+  static const int CHUNK = 16 ;
+  while (true)
+    { pthread_mutex_lock (&pl->lock) ;
+      I64 k0 = pl->next ; pl->next += CHUNK ;
+      pthread_mutex_unlock (&pl->lock) ;
+      if (k0 >= pl->nPair) break ;
+      for (I64 k = k0 ; k < k0 + CHUNK && k < pl->nPair ; ++k)
+	{ Pair *p = &pl->pair[k] ;
+	  if (p->score < 0) p->score = pairScore (pl->aSeq, pl->sp, p->i, p->j, p->threshold, &p->offset) ;
+	}
+    }
+  return 0 ;
+}
+
+static void scorePairs (Array aSeq, ScoreParams *sp, Array aPair, int nThread)
+{
+  PairListJob pl = { aSeq, sp, arrp(aPair,0,Pair), arrayMax(aPair), 0 } ;
+  pthread_mutex_init (&pl.lock, 0) ;
+  runThreads (pairListThread, &pl, nThread) ;
+  pthread_mutex_destroy (&pl.lock) ;
+}
+
+static inline Pair *addPair (Array aPair, int i, int j, int threshold)
+{ Pair *p = arrayp(aPair, arrayMax(aPair), Pair) ;
+  if (i < j) { p->i = i ; p->j = j ; } else { p->i = j ; p->j = i ; }
+  p->threshold = threshold ; p->score = -1 ; p->offset = 0 ;
+  return p ;
+}
+
+static Array lengthOrderSeqs ; // for lengthOrder(), which sorts sequence indices by length, then index
+static int lengthOrder (const void *a, const void *b)
+{ int x = *(const int*)a, y = *(const int*)b ;
+  int lx = arrp(lengthOrderSeqs,x,Seq)->len, ly = arrp(lengthOrderSeqs,y,Seq)->len ;
+  return lx != ly ? (lx < ly ? -1 : 1) : (x < y ? -1 : x > y) ;
+}
+
+// Greedy clustering: the sequences are taken from shortest to longest, and each joins the
+// cluster of the representative it scores best against, if that is within the threshold for its length,
+// else becomes the representative of a new cluster. So each representative is the shortest member of its
+// cluster. To use threads, a batch of sequences is scored against all the representatives found before
+// the batch and against all the earlier sequences in the batch, and the batch is then resolved in order,
+// which gives the same clusters as taking the sequences one at a time. These representatives have all
+// been compared with each other already, so linkRepresentatives() uses the ones chosen at the end.
+static int clusterGreedy (Array aSeq, ScoreParams *sp, double threshFac, int nThread, int *cluster)
+{
+  int nSeq = arrayMax(aSeq) ;
+  int *order = new (nSeq, int) ;
+  for (int i = 0 ; i < nSeq ; ++i) order[i] = i ;
+  lengthOrderSeqs = aSeq ; qsort (order, nSeq, sizeof(int), lengthOrder) ;
+  Array aRep = arrayCreate (1024, int) ; // representatives, in order of cluster number - 1
+  Array aPair = arrayCreate (1024, Pair) ;
+  int batch = 32 * nThread ;
+  for (int b0 = 0, b1 ; b0 < nSeq ; b0 = b1)
+    { b1 = b0 + batch ; if (b1 > nSeq) b1 = nSeq ;
+      int nRep0 = arrayMax(aRep) ;
+      arrayMax(aPair) = 0 ;
+      for (int k = b0 ; k < b1 ; ++k)
+	{ Seq *s = arrp(aSeq,order[k],Seq) ;
+	  int threshold = threshFac * s->len - 10 ; // s is at least as long as any representative
+	  for (int r = 0 ; r < nRep0 ; ++r) addPair (aPair, order[k], arr(aRep,r,int), threshold) ;
+	  for (int k2 = b0 ; k2 < k ; ++k2) addPair (aPair, order[k], order[k2], threshold) ;
+	}
+      scorePairs (aSeq, sp, aPair, nThread) ;
+      Pair *p = arrp(aPair,0,Pair) ;
+      for (int k = b0 ; k < b1 ; ++k)
+	{ int i = order[k] ; Seq *s = arrp(aSeq,i,Seq) ;
+	  int threshold = p->threshold ; // the same for all of i's pairs
+	  int best = 1 << 30, bestCluster = 0, bestRep = -1 ;
+	  for (int r = 0 ; r < nRep0 ; ++r, ++p)
+	    if (p->score <= threshold && p->score < best)
+	      { best = p->score ; bestCluster = r+1 ; bestRep = arr(aRep,r,int) ; }
+	  for (int k2 = b0 ; k2 < k ; ++k2, ++p) // later clusters, so a tie keeps the earlier one
+	    if (cluster[order[k2]] > nRep0 && arr(aRep,cluster[order[k2]]-1,int) == order[k2]
+		&& p->score <= threshold && p->score < best)
+	      { best = p->score ; bestCluster = cluster[order[k2]] ; bestRep = order[k2] ; }
+	  if (bestCluster)
+	    { cluster[i] = bestCluster ;
+	      printf ("  link cluster %d: %d (%d) to representative %d (%d) score %d thresh %d\n",
+		      bestCluster, i, s->len, bestRep, arrp(aSeq,bestRep,Seq)->len, best, threshold) ;
+	    }
+	  else
+	    { array(aRep, arrayMax(aRep), int) = i ;
+	      cluster[i] = arrayMax(aRep) ;
+	      printf ("  new cluster %d: %d (%d)\n", cluster[i], i, s->len) ;
+	    }
+	}
+    }
+  int nCluster = arrayMax(aRep) ;
+  fprintf (stderr, "greedy clustering: %d clusters\t", nCluster) ; timeUpdate (stderr) ;
+
+  arrayDestroy (aPair) ; arrayDestroy (aRep) ; newFree (order, nSeq, int) ;
+  return nCluster ;
+}
+
+// The representative of each cluster is the member with the lowest total score to all the members,
+// among those at most 1.1 times as long as the shortest member, the candidates. (Taking the lowest
+// overall, and only if that is too long the lowest among the candidates, gives the same choice.) So
+// only the candidates need scoring against all the members. This chooses rep[k] for each cluster k
+// with isDo[k] (all if isDo is 0), and sets minLen[k] and, for its members, repScore[i], the score of
+// i to rep[k]. With -allPairs, scoreij has the scores of all pairs, exact if isExact, else exact only
+// within the threshold.
+static void chooseRepresentatives (Array aSeq, ScoreParams *sp, int nThread, int *cluster, int nCluster,
+				   bool *isDo, int *scoreij, bool isExact, double threshFac,
+				   int *minLen, int *rep, int *repScore)
+{
+  int nSeq = arrayMax(aSeq) ;
+  for (int k = 0 ; k <= nCluster ; ++k) if (!isDo || isDo[k]) { minLen[k] = 1 << 30 ; rep[k] = -1 ; }
+  for (int i = 0 ; i < nSeq ; ++i)
+    if (cluster[i] && (!isDo || isDo[cluster[i]]) && arrp(aSeq,i,Seq)->len < minLen[cluster[i]])
+      minLen[cluster[i]] = arrp(aSeq,i,Seq)->len ;
+  bool *isCand = new0 (nSeq, bool) ;
+  Array *member = new0 (nCluster+1, Array) ; // the members of each cluster, in input order
+  for (int i = 0 ; i < nSeq ; ++i)
+    if (cluster[i] && (!isDo || isDo[cluster[i]]))
+      { if (arrp(aSeq,i,Seq)->len <= 1.1*minLen[cluster[i]]) isCand[i] = true ;
+	if (!member[cluster[i]]) member[cluster[i]] = arrayCreate (8, int) ;
+	array(member[cluster[i]], arrayMax(member[cluster[i]]), int) = i ;
+      }
+  Array aPair = arrayCreate (1024, Pair) ;
+  for (int k = 1 ; k <= nCluster ; ++k)
+    if (member[k])
+      for (int a = 0 ; a < arrayMax(member[k]) ; ++a)
+	for (int b = a+1 ; b < arrayMax(member[k]) ; ++b)
+	  { int i = arr(member[k],a,int), j = arr(member[k],b,int) ;
+	    if (!isCand[i] && !isCand[j]) continue ;
+	    Pair *p = addPair (aPair, i, j, NO_THRESHOLD) ;
+	    if (scoreij)
+	      { int score = scoreij[(size_t)p->i*nSeq+p->j] ;
+		if (isExact || score <= pairThreshold (threshFac, arrp(aSeq,i,Seq), arrp(aSeq,j,Seq)))
+		  p->score = score ; // else it may be a bound, so it is rescored
+	      }
+	  }
+  scorePairs (aSeq, sp, aPair, nThread) ; // the pairs not yet scored exactly
+  int *sumScore = new0 (nSeq, int) ;
+  for (I64 k = 0 ; k < arrayMax(aPair) ; ++k)
+    { Pair *p = arrp(aPair,k,Pair) ;
+      if (isCand[p->i]) sumScore[p->i] += p->score ;
+      if (isCand[p->j]) sumScore[p->j] += p->score ;
+    }
+  for (int k = 1 ; k <= nCluster ; ++k)
+    if (member[k])
+      for (int a = 0 ; a < arrayMax(member[k]) ; ++a)
+	{ int i = arr(member[k],a,int) ;
+	  if (isCand[i] && (rep[k] < 0 || sumScore[i] < sumScore[rep[k]])) rep[k] = i ;
+	}
+  for (I64 k = 0 ; k < arrayMax(aPair) ; ++k)
+    { Pair *p = arrp(aPair,k,Pair) ;
+      if (rep[cluster[p->i]] == p->i) repScore[p->j] = p->score ;
+      else if (rep[cluster[p->j]] == p->j) repScore[p->i] = p->score ;
+    }
+  for (int k = 1 ; k <= nCluster ; ++k)
+    if (member[k]) { repScore[rep[k]] = 0 ; arrayDestroy (member[k]) ; }
+  fprintf (stderr, "choosing representatives: %lld pairs scored\t", (long long)arrayMax(aPair)) ; timeUpdate (stderr) ;
+  newFree (member, nCluster+1, Array) ; newFree (isCand, nSeq, bool) ; newFree (sumScore, nSeq, int) ;
+  arrayDestroy (aPair) ;
+}
+
+// Single linkage of the clusters over all pairs of their representatives, in cluster order, keeping the
+// lower cluster number, so that e.g. subfamilies of a satellite are joined, as by -allPairs. Sets isMerged[k]
+// for each cluster k that others are merged into, and returns the number of merges.
+static int linkRepresentatives (Array aSeq, ScoreParams *sp, double threshFac, int nThread,
+				int *cluster, int nCluster, int *rep, bool *isMerged)
+{
+  int nSeq = arrayMax(aSeq) ;
+  Array aK = arrayCreate (nCluster, int) ; // the clusters with members
+  bool *isUsed = new0 (nCluster+1, bool) ;
+  for (int i = 0 ; i < nSeq ; ++i) if (cluster[i]) isUsed[cluster[i]] = true ;
+  for (int k = 1 ; k <= nCluster ; ++k) if (isUsed[k]) array(aK, arrayMax(aK), int) = k ;
+  int nK = arrayMax(aK) ;
+  Array aPair = arrayCreate (1024, Pair) ;
+  for (int a = 0 ; a < nK ; ++a)
+    for (int b = a+1 ; b < nK ; ++b)
+      { int i = rep[arr(aK,a,int)], j = rep[arr(aK,b,int)] ;
+	addPair (aPair, i, j, pairThreshold (threshFac, arrp(aSeq,i,Seq), arrp(aSeq,j,Seq))) ;
+      }
+  scorePairs (aSeq, sp, aPair, nThread) ;
+  int *map = new (nCluster+1, int) ; // the cluster each cluster is merged into
+  for (int k = 0 ; k <= nCluster ; ++k) map[k] = k ;
+  int nMerge = 0 ;
+  Pair *p = arrp(aPair,0,Pair) ;
+  for (int a = 0 ; a < nK ; ++a)
+    for (int b = a+1 ; b < nK ; ++b, ++p)
+      { int ka = arr(aK,a,int), kb = arr(aK,b,int) ;
+	if (p->score <= p->threshold && map[ka] != map[kb])
+	  { int to = min (map[ka], map[kb]), from = map[ka] + map[kb] - to ;
+	    printf ("  merge cluster %d to %d via representatives %d (%d) and %d (%d) score %d thresh %d\n",
+		    from, to, rep[ka], arrp(aSeq,rep[ka],Seq)->len, rep[kb], arrp(aSeq,rep[kb],Seq)->len,
+		    p->score, p->threshold) ;
+	    for (int k = 1 ; k <= nCluster ; ++k) if (map[k] == from) map[k] = to ;
+	    isMerged[to] = true ;
+	    ++nMerge ;
+	  }
+      }
+  for (int i = 0 ; i < nSeq ; ++i) cluster[i] = map[cluster[i]] ;
+  fprintf (stderr, "linking representatives: %d merges, %d clusters\t", nMerge, nK - nMerge) ; timeUpdate (stderr) ;
+  newFree (map, nCluster+1, int) ; newFree (isUsed, nCluster+1, bool) ;
+  arrayDestroy (aPair) ; arrayDestroy (aK) ;
+  return nMerge ;
 }
 
 void seqArrayDestroy (Array a)
@@ -151,17 +401,21 @@ int main (int argc, char *argv[])
   --argc ; ++argv ;
 
   static char *usage = "Usage: satmatch [options]* <seqfile>\n"
-    "  Clusters candidate repeat unit sequences by all-against-all alignment, in both orientations, of\n"
-    "  each sequence against the shorter one of the pair as a circle, which can wrap round any number of\n"
-    "  times, and picks a representative for each cluster.\n"
+    "  Clusters candidate repeat unit sequences by alignment, in both orientations, of each sequence\n"
+    "  against the shorter one of the pair as a circle, which can wrap round any number of times, and\n"
+    "  picks a representative for each cluster. By default sequences are taken from the shortest, and\n"
+    "  each joins the cluster of the representative so far that it matches best, or starts a new one;\n"
+    "  then clusters whose representatives match are merged, by single linkage.\n"
     "  Options:\n"
     "    -fa <file_name>         write the representative of each cluster to this fasta file\n"
-    "    -sf <file_name>         write the score of each pair of sequences to this tab-separated file\n"
+    "    -sf <file_name>         write the score of each pair of sequences to this tab-separated file,\n"
+    "                            only with -allPairs\n"
     "    -ti <n>                 transition penalty [1]\n"
     "    -tv <n>                 transversion penalty [2]\n"
     "    -gap <n>                gap penalty per position [3]\n"
     "    -minlen <n>             only use sequences at least this long [0]\n"
     "    -random <n> <len>       use n random sequences of length len instead of <seqfile>\n"
+    "    -allPairs               cluster by single linkage over all pairs of sequences\n"
     "    -T <n>                  number of threads [8]\n" ;
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
@@ -170,6 +424,7 @@ int main (int argc, char *argv[])
   int nRandom = 0, lenRandom = 0 ;
   int minSeqLen = 0 ;
   int nThread = 8 ;
+  bool isAllPairs = false ;
 
   /* Process command line options */
   while (argc > 1 && **argv == '-')
@@ -200,6 +455,8 @@ int main (int argc, char *argv[])
           if (minSeqLen < 0) die ("bad minlen %s - must be non-negative\n%s", *argv, usage) ;
           argc-- ;
         }
+      else if (!strcmp (*argv, "-allPairs"))
+	isAllPairs = true ;
       else if (!strcmp (*argv, "-T") && argc > 1)
         { nThread = atoi (*++argv) ;
           if (nThread < 1) die ("bad number of threads %s - must be at least 1\n%s", *argv, usage) ;
@@ -220,6 +477,7 @@ int main (int argc, char *argv[])
     }
   
   if (!(argc == 1 || (nRandom > 0 && argc == 0))) die (usage) ;
+  if (scoreFile && !isAllPairs) die ("-sf needs -allPairs\n%s", usage) ;
    
   Array aSeq ; 
   int totSeq = 0, nShort = 0 ;
@@ -254,99 +512,91 @@ int main (int argc, char *argv[])
     int sum = 0 ;
     for (int i = 0 ; i < NSEQ ; ++i)
       for (int j = i+1 ; j < NSEQ ; ++j)
-	sum += needlemanWunsch (arrp(a,i,Seq), arrp(a,j,Seq), &scoreParams, 0) ;
+	sum += needlemanWunsch (arrp(a,i,Seq), arrp(a,j,Seq), &scoreParams, NO_THRESHOLD, 0) ;
     seqArrayDestroy (a) ;
     threshFac = 0.75 * 0.01 * sum * 2.0 / (NSEQ*(NSEQ-1)) ; // a hack, but seems good
     fprintf (stderr, "threshold %.3f\n", threshFac) ;
   }
   
-  // score all the pairs, in parallel
-  int *scoreij = new0 ((size_t)nSeq*nSeq, int) ;
-  PairJob pj = { aSeq, &scoreParams, nSeq, scoreij, scoreFile ? new0 ((size_t)nSeq*nSeq, int) : 0, 0 } ;
-  pthread_mutex_init (&pj.lock, 0) ;
-  if (nThread == 1)
-    pairThread (&pj) ;
-  else
-    { pthread_t *thread = new (nThread, pthread_t) ;
-      for (int t = 0 ; t < nThread ; ++t)
-	if (pthread_create (&thread[t], 0, pairThread, &pj)) die ("failed to create thread %d", t) ;
-      for (int t = 0 ; t < nThread ; ++t) pthread_join (thread[t], 0) ;
-      newFree (thread, nThread, pthread_t) ;
-    }
-  pthread_mutex_destroy (&pj.lock) ;
-
-  // now go through the pairs in order, linking them into clusters
-  int *mark = new0 (nSeq, int) ;
-  int nMark = 0 ;
+  int *cluster = new0 (nSeq, int) ; // 1-based cluster number of each sequence
+  int nCluster = 0 ;
+  int *scoreij = 0 ;	  // with -allPairs, the scores of all pairs i < j
   if (scoreFile) fprintf (scoreFile, "#seq1\tlen1\tseq2\tlen2\tscore\torientation\toffset\n") ;
-  for (int i = 0 ; i < nSeq ; i++)
-    for (int j = i+1 ; j < nSeq ; j++)
-      { Seq *si = arrp(aSeq,i,Seq) ;
-        Seq *sj = arrp(aSeq,j,Seq) ;
-	int score = scoreij[(size_t)i*nSeq+j] ;
-	if (scoreFile)
-	  { int offset = pj.offsetij[(size_t)i*nSeq+j] ;
-	    fprintf (scoreFile, "%s\t%d\t%s\t%d\t%d\t%c\t%d\n", si->name, si->len, sj->name, sj->len,
-		     score, offset >= 0 ? '+' : '-', offset >= 0 ? offset : -offset-1) ;
-	  }
-	
-	int threshold = threshFac * (si->len < sj->len ? sj->len : si->len) - 10 ;
-	if (score <= threshold) // link it
-	  { if (mark[i] && mark[j])
-	      { if (mark[i] != mark[j])
-		  { int from, to ; to = min (mark[i], mark[j]) ; from = mark[i]+mark[j] - to ;
-		    printf ("  merge mark %d to %d via %d (%d) to %d (%d) score %d thresh %d\n",
-			    from, to, i, si->len, j, sj->len, score, threshold) ;
-		    for (int k = 0 ; k < nSeq ; ++k) if (mark[k] == from) mark[k] = to ;
+  if (isAllPairs)
+    { // score all the pairs, in parallel
+      scoreij = new0 ((size_t)nSeq*nSeq, int) ;
+      PairJob pj = { aSeq, &scoreParams, nSeq, scoreij, scoreFile ? new0 ((size_t)nSeq*nSeq, int) : 0,
+		     scoreFile ? 0 : threshFac, 0 } ; // with -sf the scores of all pairs are wanted
+      pthread_mutex_init (&pj.lock, 0) ;
+      runThreads (pairThread, &pj, nThread) ;
+      pthread_mutex_destroy (&pj.lock) ;
+      fprintf (stderr, "scoring all pairs\t") ; timeUpdate (stderr) ;
+
+      // now go through the pairs in order, linking them into clusters by single linkage
+      for (int i = 0 ; i < nSeq ; i++)
+	for (int j = i+1 ; j < nSeq ; j++)
+	  { Seq *si = arrp(aSeq,i,Seq) ;
+	    Seq *sj = arrp(aSeq,j,Seq) ;
+	    int score = scoreij[(size_t)i*nSeq+j] ;
+	    if (scoreFile)
+	      { int offset = pj.offsetij[(size_t)i*nSeq+j] ;
+		fprintf (scoreFile, "%s\t%d\t%s\t%d\t%d\t%c\t%d\n", si->name, si->len, sj->name, sj->len,
+			 score, offset >= 0 ? '+' : '-', offset >= 0 ? offset : -offset-1) ;
+	      }
+	    int threshold = threshFac * (si->len < sj->len ? sj->len : si->len) - 10 ;
+	    if (score <= threshold) // link it
+	      { if (cluster[i] && cluster[j])
+		  { if (cluster[i] != cluster[j])
+		      { int from, to ; to = min (cluster[i], cluster[j]) ; from = cluster[i]+cluster[j] - to ;
+			printf ("  merge mark %d to %d via %d (%d) to %d (%d) score %d thresh %d\n",
+				from, to, i, si->len, j, sj->len, score, threshold) ;
+			for (int k = 0 ; k < nSeq ; ++k) if (cluster[k] == from) cluster[k] = to ;
+		      }
+		  }
+		else if (!cluster[i] && !cluster[j])
+		  { cluster[i] = cluster[j] = ++nCluster ;
+		    printf ("  new mark %d: %d (%d) to %d (%d) score %d thresh %d\n",
+			    nCluster, i, si->len, j, sj->len, score, threshold) ;
+		  }
+		else if (cluster[i] && !cluster[j])
+		  { cluster[j] = cluster[i] ;
+		    printf ("  link mark %d: %d (%d) to %d (%d) score %d thresh %d\n",
+			    cluster[i], i, si->len, j, sj->len, score, threshold) ;
+		  }
+		else if (!cluster[i] && cluster[j])
+		  { cluster[i] = cluster[j] ;
+		    printf ("  link mark %d: %d (%d) to %d (%d) score %d thresh %d\n",
+			    cluster[j], j, sj->len, i, si->len, score, threshold) ;
 		  }
 	      }
-	    else if (!mark[i] && !mark[j])
-	      { mark[i] = mark[j] = ++nMark ;
-		printf ("  new mark %d: %d (%d) to %d (%d) score %d thresh %d\n",
-			nMark, i, si->len, j, sj->len, score, threshold) ;
-	      }
-	    else if (mark[i] && !mark[j])
-	      { mark[j] = mark[i] ;
-		printf ("  link mark %d: %d (%d) to %d (%d) score %d thresh %d\n",
-			mark[i], i, si->len, j, sj->len, score, threshold) ;
-	      }
-	    else if (!mark[i] && mark[j])
-	      { mark[i] = mark[j] ;
-		printf ("  link mark %d: %d (%d) to %d (%d) score %d thresh %d\n",
-			mark[j], j, sj->len, i, si->len, score, threshold) ;
-	      }
 	  }
+      if (pj.offsetij) newFree (pj.offsetij, (size_t)nSeq*nSeq, int) ;
+    }
+  else
+    nCluster = clusterGreedy (aSeq, &scoreParams, threshFac, nThread, cluster) ;
+
+  int *minLen = new (nCluster+1, int), *rep = new (nCluster+1, int) ;
+  int *repScore = new0 (nSeq, int) ; // score of each sequence to the representative of its cluster
+  chooseRepresentatives (aSeq, &scoreParams, nThread, cluster, nCluster, 0, scoreij, scoreFile != 0,
+			 threshFac, minLen, rep, repScore) ;
+  if (!isAllPairs) // link the clusters via their representatives, and choose again for merged ones
+    { bool *isMerged = new0 (nCluster+1, bool) ;
+      if (linkRepresentatives (aSeq, &scoreParams, threshFac, nThread, cluster, nCluster, rep, isMerged))
+	chooseRepresentatives (aSeq, &scoreParams, nThread, cluster, nCluster, isMerged, 0, false,
+			       threshFac, minLen, rep, repScore) ;
+      newFree (isMerged, nCluster+1, bool) ;
+    }
+  Array *member = new0 (nCluster+1, Array) ; // the members of each cluster, in input order
+  for (int i = 0 ; i < nSeq ; ++i)
+    if (cluster[i])
+      { if (!member[cluster[i]]) member[cluster[i]] = arrayCreate (8, int) ;
+	array(member[cluster[i]], arrayMax(member[cluster[i]]), int) = i ;
       }
 
-  int *sumScore = new0 (nSeq, int) ;
-  for (int i = 0 ; i < nSeq ; ++i)
-    for (int j = 0 ; j < nSeq ; ++j)
-      if (mark[i] && mark[i] == mark[j])
-	{ sumScore[i] += scoreij[(size_t)i*nSeq+j] ;
-	  sumScore[j] += scoreij[(size_t)i*nSeq+j] ;
-	}
-
-  for (int k = 1 ; k <= nMark ; ++k)
-    { int count = 0, minLen = 1<<30, minSum = 1<<30, iMinSum = -1 ;
-      for (int i = 0 ; i < nSeq ; ++i)
-	if (mark[i] == k)
-	  { ++count ;
-	    Seq *s = arrp(aSeq,i,Seq) ;
-	    if (s->len < minLen) minLen = s->len ;
-	    if (sumScore[i] < minSum) { minSum = sumScore[i] ; iMinSum = i ; }
-	  }
-      if (!count) continue ;
-      if (arrp(aSeq,iMinSum,Seq)->len > 1.1*minLen) // need to look again
-	{ minSum = 1 << 30 ; iMinSum = -1 ;
-	  for (int i = 0 ; i < nSeq ; ++i)
-	    if (mark[i] == k)
-	      { Seq *s = arrp(aSeq,i,Seq) ;
-		if (s->len <= 1.1*minLen && sumScore[i] < minSum)
-		  { minSum = sumScore[i] ; iMinSum = i ; }
-	      }
-	}
-      Seq *s = arrp(aSeq, iMinSum, Seq) ;
-      printf ("cluster %d count %d minLen %d repLen %d ", k, count, minLen, s->len) ;
+  for (int k = 1 ; k <= nCluster ; ++k)
+    { if (!member[k]) continue ;
+      Seq *s = arrp(aSeq, rep[k], Seq) ;
+      printf ("cluster %d count %d minLen %d repLen %d ", k, (int)arrayMax(member[k]), minLen[k], s->len) ;
       for (int i = 0 ; i < s->len ; ++i) putchar (index2char[s->seq[i]]) ;
       putchar ('\n') ;
       if (fastaFile)
@@ -354,18 +604,18 @@ int main (int argc, char *argv[])
 	  for (int i = 0 ; i < s->len ; ++i) fputc (index2char[s->seq[i]], fastaFile) ;
 	  fputc ('\n', fastaFile) ;
 	}
-      for (int i = 0 ; i < nSeq ; ++i)
-	if (mark[i] == k)
-	  { Seq *s = arrp(aSeq,i,Seq) ;
-	    printf ("  %s\t%d\t%d\n", s->name, s->len,
-		    i < iMinSum ? scoreij[(size_t)i*nSeq+iMinSum] : scoreij[(size_t)iMinSum*nSeq+i]) ; // only i < j is filled
-	  }
+      for (int a = 0 ; a < arrayMax(member[k]) ; ++a)
+	{ Seq *s = arrp(aSeq, arr(member[k],a,int), Seq) ;
+	  printf ("  %s\t%d\t%d\n", s->name, s->len, repScore[arr(member[k],a,int)]) ;
+	}
     }
 
-  newFree (mark, nSeq, int) ;
-  newFree (sumScore, nSeq, int) ;
-  newFree (scoreij, (size_t)nSeq*nSeq, int) ;
-  if (pj.offsetij) newFree (pj.offsetij, (size_t)nSeq*nSeq, int) ;
+  for (int k = 1 ; k <= nCluster ; ++k) if (member[k]) arrayDestroy (member[k]) ;
+  newFree (member, nCluster+1, Array) ;
+  newFree (minLen, nCluster+1, int) ; newFree (rep, nCluster+1, int) ;
+  newFree (repScore, nSeq, int) ;
+  newFree (cluster, nSeq, int) ;
+  if (scoreij) newFree (scoreij, (size_t)nSeq*nSeq, int) ;
   if (fastaFile) fclose (fastaFile) ;
   if (scoreFile) fclose (scoreFile) ;
   seqArrayDestroy (aSeq) ;
