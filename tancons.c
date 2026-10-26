@@ -5,7 +5,7 @@
  * Description: make a consensus for at least one tandem array in a FasTAN .1ano file
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 26 00:06 2026 (claude)
+ * Last edited: Oct 26 01:24 2026 (claude)
  * Created: Thu Aug 7 02:48:43 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -35,7 +35,9 @@ void parseCoord (char *s, I64 *start, I64 *end)
   if (*end && *start > *end) die ("start %llu > end %llu in %s", *start, *end, text) ;
 }
 
-bool readAnoBlock (OneFile *of, Gdb *gdb, TanLine *tl, int minCount, int minUnit) // fills tl
+// fills tl; keeps the array only if it has at least minCount exact-unit copies, a unit of at least minUnit
+// and a length (end - start) of at least minLen
+bool readAnoBlock (OneFile *of, Gdb *gdb, TanLine *tl, int minCount, int minUnit, I64 minLen)
 {
   if (of->lineType != 'M') die ("bad call to readAnoLine - at line type %c", of->lineType) ;
   tl->seq = oneInt(of,0) ;
@@ -45,7 +47,7 @@ bool readAnoBlock (OneFile *of, Gdb *gdb, TanLine *tl, int minCount, int minUnit
   bool retVal = false ;
   while (oneReadLine(of))
     if (of->lineType == 'L') tl->unit = atoi(oneString(of)) ;
-    else if (of->lineType == 'P' && tl->unit >= minUnit)
+    else if (of->lineType == 'P' && tl->unit >= minUnit && tl->end - tl->start >= minLen)
       { I64 n = oneLen(of) ;
 	I64 *parse = oneIntList(of) ;
 	for (int i = 0 ; i < n-1 ; ++i) if (parse[i+1] - parse[i] == tl->unit) ++tl->count ;
@@ -86,6 +88,7 @@ int main (int argc, char *argv[])
     "    -c <seq>:<start>-<end>  report only the array in seq starting at start (and ending at end, if not 0)\n"
     "    -m <n>                  minimum number of exact-unit copies, if not -u or -c [1]\n"
     "    -umin <n>               minimum unit size, if not -u or -c [10]\n"
+    "    -minlen <n>             minimum length of the whole array, if not -u or -c [0]\n"
     "    -s <file_name>          sequence file, if not found from the .1ano header\n" ;
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
@@ -95,6 +98,7 @@ int main (int argc, char *argv[])
   char *seqId    = 0 ;
   int   minCount = 1 ;
   int   minUnit  = 10 ;
+  I64   minLen   = 0 ;
 
   Array atl = arrayCreate (1024, TanLine) ;
   while (argc > 0 && **argv == '-')
@@ -115,6 +119,11 @@ int main (int argc, char *argv[])
       else if (!strcmp (*argv, "-umin") && argc > 1)
 	{ minUnit = atoi(*++argv) ;
 	  if (minUnit < 1) die ("min unit size %s must be at least 1", *argv) ;
+	  --argc ;
+	}
+      else if (!strcmp (*argv, "-minlen") && argc > 1)
+	{ minLen = atoll(*++argv) ;
+	  if (minLen < 0) die ("min array length %s must be non-negative", *argv) ;
 	  --argc ;
 	}
       else if (!strcmp (*argv, "-s") && argc > 1) 
@@ -148,7 +157,7 @@ int main (int argc, char *argv[])
         die ("failed to find %s in sequence names for %s", seqId, *argv) ;
       TanLine tl ;
       while (of->lineType == 'M')
-	if (readAnoBlock(of, gdb, &tl, 0, 1)) // -umin does not apply with -c
+	if (readAnoBlock(of, gdb, &tl, 0, 1, 0)) // -umin and -minlen do not apply with -c
 	  { if (tl.seq == tl0->seq && tl.start == tl0->start && (!tl0->end || tl.end == tl0->end))
 	      { *tl0 = tl ;
 		break ; // we are done
@@ -160,7 +169,7 @@ int main (int argc, char *argv[])
     { int maxCount = 0 ;
       TanLine tl ;
       while (of->lineType == 'M')
-	if (readAnoBlock(of, gdb, &tl, maxCount, 1)) // nor with -u
+	if (readAnoBlock(of, gdb, &tl, maxCount, 1, 0)) // nor with -u
 	  { if (tl.unit == unit && tl.count > maxCount)
 	      { maxCount = tl.count ;
 		if (arrayMax(atl))
@@ -179,7 +188,7 @@ int main (int argc, char *argv[])
     }
   else // place in atl all TanLines with at least minCount copies
     { while (of->lineType == 'M')
-	if (!readAnoBlock(of, gdb, arrayp(atl,arrayMax(atl),TanLine), minCount, minUnit)) --arrayMax(atl) ;
+	if (!readAnoBlock(of, gdb, arrayp(atl,arrayMax(atl),TanLine), minCount, minUnit, minLen)) --arrayMax(atl) ;
       if (!arrayMax(atl))
 	die ("failed to find any tandem repeat with at least %d copies in .1ano file", minCount) ;
     }

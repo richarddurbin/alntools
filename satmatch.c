@@ -13,7 +13,7 @@
  *   - satmatch(): main alignment routine
  *
  * HISTORY:
- * Last edited: Aug 25 19:14 2026 (rd109)
+ * Last edited: Oct 26 01:32 2026 (claude)
  * Created: Tue Aug 11 08:32:53 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -23,6 +23,7 @@
 #include "seqio.h"
 #include "ONElib.h"
 #include <string.h>
+#include <pthread.h>
 
 typedef struct {
   int   len ;
@@ -35,7 +36,6 @@ typedef struct {
   int transition ;      /* A<->G, C<->T */
   int transversion ;    /* A<->C, A<->T, G<->C, G<->T */
   int gap ;             /* gap penalty per position */
-  bool isLoop ;
 } ScoreParams ;
 
 static inline int min (int x, int y) { return x < y ? x : y ; }
@@ -55,19 +55,15 @@ int needlemanWunsch (Seq *s1, Seq *s2, ScoreParams *sp, int *jMax)
   cost[0][0] = cost[1][1] = cost[2][2] = cost[3][3] = 0 ;  // Diagonal = match
   cost[0][2] = cost[2][0] = cost[1][3] = cost[3][1] = sp->transition ;  // A<>G (0^2), C<>T (1^3)
 
-  // Allocate two rows
-  int *prev = new0 (len2+1, int) ; // 0 if looping
+  // Allocate two rows; the first is 0, so the alignment can start at any rotation of s2
+  int *prev = new0 (len2+1, int) ;
   int *row = new (len2+1, int) ;
-  // Initialize first row with gaps unless looping
-  if (!sp->isLoop) for (j = 0 ; j <= len2 ; j++) prev[j] = j * sp->gap ;
 
   // Fill DP
   //  for (j = 0 ; j < len1 ; ++j) printf ("  %c", s2->seq[j]) ; putchar ('\n') ;
   for (i = 1 ; i <= len1 ; i++)
-    { if (sp->isLoop)
-	row[0] = min (prev[len2-1]+cost[s1->seq[i-1]][s2->seq[len2-1]], sp->gap+prev[len2]) ;
-      else
-	row[0] = i * sp->gap ;
+    { // s2 is circular: column 0 continues from the end of s2, so the shorter s2 can wrap many times
+      row[0] = min (prev[len2-1]+cost[s1->seq[i-1]][s2->seq[len2-1]], sp->gap+prev[len2]) ;
       // printf ("%c %2d", index2char[s1->seq[i-1]], row[0]) ;
       for (j = 1 ; j <= len2 ; j++)
         { int d = prev[j-1] + cost[s1->seq[i-1]][s2->seq[j-1]] ;  // diagonal: match/mismatch
@@ -79,13 +75,9 @@ int needlemanWunsch (Seq *s1, Seq *s2, ScoreParams *sp, int *jMax)
       int *tmp = prev ; prev = row ; row = tmp ; // swap rows
     }
   
-  int score ;
-  if (sp->isLoop)
-    { score = 3 * len1 ;
-      for (j = 0 ; j < len2 ; ++j)
-	if (prev[j] < score) { score = prev[j] ; if (jMax) *jMax = j ; }
-    }
-  else score = prev[len2] ;
+  int score = 3 * len1 ; // the best end, at any position in s2
+  for (j = 0 ; j < len2 ; ++j)
+    if (prev[j] < score) { score = prev[j] ; if (jMax) *jMax = j ; }
   
   newFree (prev, len2+1, int) ;
   newFree (row, len2+1, int) ;
@@ -105,6 +97,43 @@ Array randomSeqs (int n, int len)
   return a ;
 }
 
+// All pairs are scored by nThread threads, each taking the next unscored row i and scoring (i,j) for all
+// j > i, before the pairs are linked into clusters in order, so the results do not depend on nThread.
+typedef struct {
+  Array aSeq ;
+  ScoreParams *sp ;
+  int nSeq ;
+  int *scoreij ;	// nSeq*nSeq: the better score of (i,j) over both orientations of j, for j > i
+  int *offsetij ;	// if not 0, the end offset of that alignment, as -(offset+1) if j was reverse complemented
+  int nextRow ;
+  pthread_mutex_t lock ;
+} PairJob ;
+
+static void scorePair (PairJob *pj, int i, int j)
+{
+  Seq *si = arrp(pj->aSeq,i,Seq), *sj = arrp(pj->aSeq,j,Seq) ;
+  Seq sjRC = *sj ; sjRC.seq = sj->rSeq ; // so sj itself is never changed while other threads read it
+  int jMax1 = 0, jMax2 = 0 ;
+  int score1 = needlemanWunsch (si, sj, pj->sp, &jMax1) ;
+  int score2 = needlemanWunsch (si, &sjRC, pj->sp, &jMax2) ;
+  size_t k = (size_t)i*pj->nSeq + j ;
+  pj->scoreij[k] = min (score1, score2) ;
+  if (pj->offsetij) pj->offsetij[k] = (score1 <= score2) ? jMax1 : -(jMax2+1) ;
+}
+
+static void *pairThread (void *arg)
+{
+  PairJob *pj = (PairJob*) arg ;
+  while (true)
+    { pthread_mutex_lock (&pj->lock) ;
+      int i = pj->nextRow++ ;
+      pthread_mutex_unlock (&pj->lock) ;
+      if (i >= pj->nSeq) break ;
+      for (int j = i+1 ; j < pj->nSeq ; ++j) scorePair (pj, i, j) ;
+    }
+  return 0 ;
+}
+
 void seqArrayDestroy (Array a)
 {
   for (int i = 0 ; i < arrayMax(a) ; ++i)
@@ -121,12 +150,26 @@ int main (int argc, char *argv[])
   storeCommandLine (argc, argv) ;
   --argc ; ++argv ;
 
-  static char *usage = "Usage: satmatch [-sf <scorefile>] [-fa <fastafile>] [-ti <n>] [-tv <n>] [-gap <n>] [-loop] [-random <n> <len>] <seqfile>" ;
-  if (!argc) { fprintf (stderr, "%s\n", usage) ; exit(1) ; }
+  static char *usage = "Usage: satmatch [options]* <seqfile>\n"
+    "  Clusters candidate repeat unit sequences by all-against-all alignment, in both orientations, of\n"
+    "  each sequence against the shorter one of the pair as a circle, which can wrap round any number of\n"
+    "  times, and picks a representative for each cluster.\n"
+    "  Options:\n"
+    "    -fa <file_name>         write the representative of each cluster to this fasta file\n"
+    "    -sf <file_name>         write the score of each pair of sequences to this tab-separated file\n"
+    "    -ti <n>                 transition penalty [1]\n"
+    "    -tv <n>                 transversion penalty [2]\n"
+    "    -gap <n>                gap penalty per position [3]\n"
+    "    -minlen <n>             only use sequences at least this long [0]\n"
+    "    -random <n> <len>       use n random sequences of length len instead of <seqfile>\n"
+    "    -T <n>                  number of threads [8]\n" ;
+  if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
   FILE *scoreFile = 0, *fastaFile = 0 ;
-  ScoreParams scoreParams = {1,2,3,false} ;
+  ScoreParams scoreParams = {1,2,3} ;
   int nRandom = 0, lenRandom = 0 ;
+  int minSeqLen = 0 ;
+  int nThread = 8 ;
 
   /* Process command line options */
   while (argc > 1 && **argv == '-')
@@ -152,8 +195,16 @@ int main (int argc, char *argv[])
           if (scoreParams.gap <= 0) die ("bad gap score %s\n%s", *argv, usage) ;
           argc-- ;
         }
-      else if (!strcmp (*argv, "-loop"))
-	{ scoreParams.isLoop = true ; }
+      else if (!strcmp (*argv, "-minlen") && argc > 1)
+        { minSeqLen = atoi (*++argv) ;
+          if (minSeqLen < 0) die ("bad minlen %s - must be non-negative\n%s", *argv, usage) ;
+          argc-- ;
+        }
+      else if (!strcmp (*argv, "-T") && argc > 1)
+        { nThread = atoi (*++argv) ;
+          if (nThread < 1) die ("bad number of threads %s - must be at least 1\n%s", *argv, usage) ;
+          argc-- ;
+        }
       else if (!strcmp(*argv, "-random") && argc > 2)
 	{ nRandom = atoi (*++argv) ;
 	  lenRandom = atoi (*++argv) ;
@@ -171,7 +222,7 @@ int main (int argc, char *argv[])
   if (!(argc == 1 || (nRandom > 0 && argc == 0))) die (usage) ;
    
   Array aSeq ; 
-  int totSeq = 0 ;
+  int totSeq = 0, nShort = 0 ;
   if (nRandom > 0)
     { aSeq = randomSeqs (nRandom, lenRandom) ;
       totSeq = nRandom * lenRandom ;
@@ -181,7 +232,8 @@ int main (int argc, char *argv[])
       if (!sio) die ("failed to open sequence file %s", *argv) ;
       aSeq = arrayCreate (256, Seq) ;
       while (seqIOread (sio))
-	{ Seq *s = arrayp (aSeq, arrayMax(aSeq), Seq) ;
+	{ if (sio->seqLen < minSeqLen) { ++nShort ; continue ; }
+	  Seq *s = arrayp (aSeq, arrayMax(aSeq), Seq) ;
 	  s->len = sio->seqLen ;
 	  s->name = strdup (sqioId(sio)) ;
 	  s->seq = new (s->len, char) ; memcpy (s->seq, sqioSeq(sio), s->len) ;
@@ -190,32 +242,10 @@ int main (int argc, char *argv[])
 	}
       seqIOclose (sio) ;
     }
-  fprintf (stderr, "%d sequences, total length %d\n", (int)arrayMax(aSeq), totSeq) ;
+  fprintf (stderr, "%d sequences, total length %d", (int)arrayMax(aSeq), totSeq) ;
+  if (nShort) fprintf (stderr, ", after skipping %d shorter than %d", nShort, minSeqLen) ;
+  fputc ('\n', stderr) ;
   int nSeq = arrayMax(aSeq) ;
-
-  // precluster the sequences based on composition
-  // then for each cluster construct the mean and calculate a score threshold
-  int *tClus = new0 (nSeq, int) ;
-  int nTclus = 0 ;
-  int *freq  = new0 (nSeq*4, int) ;
-  for (int i = 0 ; i < nSeq ; ++i)
-    { Seq *s = arrp (aSeq, i, Seq) ;
-      int *f = freq + 4*i ;
-      for (int j = 0 ; j < s->len ; ++j) ++f[s->seq[j]] ;
-      if (f[0]+f[1] > f[2]+f[3]) // swap AC and TG
-	{ int t = f[0] ; f[0] = f[3] ; f[3] = t ; t = f[1] ; f[1] = f[2] ; f[2] = t ; }
-      for (int k = 0 ; k < i ; ++k)
-	{ int *g = freq + 4*k ;
-	  int sum2 = (f[0]-g[0])*(f[0]-g[0]) + (f[1]-g[1])*(f[1]-g[1]) +
-	    (f[2]-g[2])*(f[2]-g[2]) + (f[3]-g[3])*(f[3]-g[3]) ;
-	  if (sum2 <= 2*(s->len + arrp(aSeq,k,Seq)->len))
-	    { tClus[i] = tClus[k] ;
-	      break ;
-	    }
-	  if (!tClus[i]) tClus[i] = ++nTclus ;
-	}
-    }
-  fprintf (stderr, "found %d frequency-based clusters\n", nTclus) ;
 
   // estimate significance threshold
   double threshFac ;
@@ -230,31 +260,34 @@ int main (int argc, char *argv[])
     fprintf (stderr, "threshold %.3f\n", threshFac) ;
   }
   
-  // now go through comparing the sequences
+  // score all the pairs, in parallel
+  int *scoreij = new0 ((size_t)nSeq*nSeq, int) ;
+  PairJob pj = { aSeq, &scoreParams, nSeq, scoreij, scoreFile ? new0 ((size_t)nSeq*nSeq, int) : 0, 0 } ;
+  pthread_mutex_init (&pj.lock, 0) ;
+  if (nThread == 1)
+    pairThread (&pj) ;
+  else
+    { pthread_t *thread = new (nThread, pthread_t) ;
+      for (int t = 0 ; t < nThread ; ++t)
+	if (pthread_create (&thread[t], 0, pairThread, &pj)) die ("failed to create thread %d", t) ;
+      for (int t = 0 ; t < nThread ; ++t) pthread_join (thread[t], 0) ;
+      newFree (thread, nThread, pthread_t) ;
+    }
+  pthread_mutex_destroy (&pj.lock) ;
+
+  // now go through the pairs in order, linking them into clusters
   int *mark = new0 (nSeq, int) ;
-  int *scoreij = new0 (nSeq*nSeq, int) ;
   int nMark = 0 ;
   if (scoreFile) fprintf (scoreFile, "#seq1\tlen1\tseq2\tlen2\tscore\torientation\toffset\n") ;
   for (int i = 0 ; i < nSeq ; i++)
     for (int j = i+1 ; j < nSeq ; j++)
       { Seq *si = arrp(aSeq,i,Seq) ;
         Seq *sj = arrp(aSeq,j,Seq) ;
-	int jMax1 = 0, jMax2 = 0 ;
-        int score1 = needlemanWunsch(si, sj, &scoreParams, &jMax1) ;
-	bool isRC = false ;
-	char *tmp = sj->seq ; sj->seq = sj->rSeq ; sj->rSeq = tmp ;
-	int score2 = needlemanWunsch(si, sj, &scoreParams, &jMax2) ;
-	tmp = sj->seq ; sj->seq = sj->rSeq ; sj->rSeq = tmp ;
-
-	int score = min (score1, score2) ;
-	scoreij[i*nSeq+j] = score ;
+	int score = scoreij[(size_t)i*nSeq+j] ;
 	if (scoreFile)
-	  { if (score == score1)
-	      fprintf (scoreFile, "%s\t%d\t%s\t%d\t%d\t+\t%d\n",
-		       si->name, si->len, sj->name, sj->len, score1, jMax1) ;
-	    else
-	      fprintf (scoreFile, "%s\t%d\t%s\t%d\t%d\t-\t%d\n",
-		       si->name, si->len, sj->name, sj->len, score2, jMax2) ;
+	  { int offset = pj.offsetij[(size_t)i*nSeq+j] ;
+	    fprintf (scoreFile, "%s\t%d\t%s\t%d\t%d\t%c\t%d\n", si->name, si->len, sj->name, sj->len,
+		     score, offset >= 0 ? '+' : '-', offset >= 0 ? offset : -offset-1) ;
 	  }
 	
 	int threshold = threshFac * (si->len < sj->len ? sj->len : si->len) - 10 ;
@@ -289,8 +322,8 @@ int main (int argc, char *argv[])
   for (int i = 0 ; i < nSeq ; ++i)
     for (int j = 0 ; j < nSeq ; ++j)
       if (mark[i] && mark[i] == mark[j])
-	{ sumScore[i] += scoreij[i*nSeq+j] ;
-	  sumScore[j] += scoreij[i*nSeq+j] ;
+	{ sumScore[i] += scoreij[(size_t)i*nSeq+j] ;
+	  sumScore[j] += scoreij[(size_t)i*nSeq+j] ;
 	}
 
   for (int k = 1 ; k <= nMark ; ++k)
@@ -324,11 +357,15 @@ int main (int argc, char *argv[])
       for (int i = 0 ; i < nSeq ; ++i)
 	if (mark[i] == k)
 	  { Seq *s = arrp(aSeq,i,Seq) ;
-	    printf ("  %s\t%d\t%d\n", s->name, s->len, scoreij[i*nSeq+iMinSum]) ;
+	    printf ("  %s\t%d\t%d\n", s->name, s->len,
+		    i < iMinSum ? scoreij[(size_t)i*nSeq+iMinSum] : scoreij[(size_t)iMinSum*nSeq+i]) ; // only i < j is filled
 	  }
     }
 
   newFree (mark, nSeq, int) ;
+  newFree (sumScore, nSeq, int) ;
+  newFree (scoreij, (size_t)nSeq*nSeq, int) ;
+  if (pj.offsetij) newFree (pj.offsetij, (size_t)nSeq*nSeq, int) ;
   if (fastaFile) fclose (fastaFile) ;
   if (scoreFile) fclose (scoreFile) ;
   seqArrayDestroy (aSeq) ;
