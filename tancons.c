@@ -5,7 +5,7 @@
  * Description: make a consensus for at least one tandem array in a FasTAN .1ano file
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 20 18:52 2026 (claude)
+ * Last edited: Oct 26 00:06 2026 (claude)
  * Created: Thu Aug 7 02:48:43 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -85,7 +85,7 @@ int main (int argc, char *argv[])
     "    -u <n>                  report only the array of unit size n with the most exact-unit copies\n"
     "    -c <seq>:<start>-<end>  report only the array in seq starting at start (and ending at end, if not 0)\n"
     "    -m <n>                  minimum number of exact-unit copies, if not -u or -c [1]\n"
-    "    -umin <n>               minimum unit size, if not -u or -c [20]\n"
+    "    -umin <n>               minimum unit size, if not -u or -c [10]\n"
     "    -s <file_name>          sequence file, if not found from the .1ano header\n" ;
   if (!argc) { fprintf (stderr, "%s", usage) ; exit(1) ; }
 
@@ -94,7 +94,7 @@ int main (int argc, char *argv[])
   char *seqFile  = 0 ;
   char *seqId    = 0 ;
   int   minCount = 1 ;
-  int   minUnit  = 20 ;
+  int   minUnit  = 10 ;
 
   Array atl = arrayCreate (1024, TanLine) ;
   while (argc > 0 && **argv == '-')
