@@ -13,7 +13,7 @@
  *   - satmatch(): main alignment routine
  *
  * HISTORY:
- * Last edited: Oct 26 17:43 2026 (claude)
+ * Last edited: Oct 27 01:34 2026 (claude)
  * Created: Tue Aug 11 08:32:53 2026 (rd109)
  *-------------------------------------------------------------------
  */
@@ -101,17 +101,19 @@ int needlemanWunsch (Seq *s1, Seq *s2, ScoreParams *sp, int threshold, int *jMax
 // Single-cycle alignment, used by the greedy clustering: the best cost of aligning all of the shorter
 // sequence S against exactly one cycle of the longer one R, starting at any rotation of R, so with no
 // multiple copies. R is on the columns, as a circle, and S on the rows. Each cell holds the cost in its upper
-// 32 bits and, in its lower 32 bits, the column of R at which its least-cost path started, carried along by
-// taking the minimum of the packed values. On the last row, a cell whose start is the column after it has
-// gone exactly once round R, so its cost is that of a real single-cycle alignment: the least of these is an
+// 32 bits and, in its lower 32 bits, the column of R at which its least-cost path started, plus L each time
+// the path crossed from the last column to the first, carried along by taking the minimum of the packed
+// values. A path starting at column 0 begins from the cell for column L-1, so every single cycle crosses
+// exactly once. On the last row, a cell whose start is the column after it, having crossed once, has gone
+// exactly once round R (one that has not crossed has consumed no column of R), so its cost is that of a real single-cycle alignment: the least of these is an
 // upper bound UB on the best. The least cost of the whole row, ending anywhere, is a lower bound LB, as the
 // paths it allows include all single-cycle ones. So if LB > threshold the pair cannot link, and if
 // UB <= threshold it can. Otherwise, rarely, R is aligned globally from each of the starts of the cheapest
 // last-row cells. All costs are non-negative, so once a row's least cost is above threshold the alignment
 // stops, returning it, a bound above threshold.
 
-#define NTRY 16 // the most last-row cells whose starts are tried when the bounds leave a pair undecided
-typedef struct { I64 aligned, ambiguous, resolved ; } CyclicStats ; // counts of alignments, kept atomically
+#define NTRY 64 // the most last-row cells whose starts are tried when the bounds leave a pair undecided
+typedef struct { I64 aligned, earlyExit, lowerBound, upperBound, ambiguous, resolved ; } CyclicStats ; // counts of alignments, kept atomically
 static CyclicStats cyclicStats ;
 
 static void costTable (ScoreParams *sp, int cost[4][4])
@@ -151,6 +153,7 @@ static int cyclicCost (Seq *a, Seq *b, ScoreParams *sp, int threshold)
   int L = rs->len, n = ss->len ;
   int cost[4][4] ; costTable (sp, cost) ;
   I64 G = (I64)sp->gap << 32 ;
+  I64 WRAP = L ; // added to the start label on crossing from column L-1 to 0, so labels count cycles
   I64 *prev = new (L, I64), *cur = new (L, I64) ;
   for (int j = 0 ; j < L ; ++j) prev[j] = (j+1 == L) ? 0 : j+1 ; // cost 0, starting at the next column
   __atomic_fetch_add (&cyclicStats.aligned, 1, __ATOMIC_RELAXED) ;
@@ -158,29 +161,33 @@ static int cyclicCost (Seq *a, Seq *b, ScoreParams *sp, int threshold)
     { int c = s[i] ;
       I64 rowMin ;
       for (int j = 0 ; j < L ; ++j) // diagonal from column j-1, and a gap in R (S[i] alone) from above
-	{ I64 d = prev[j ? j-1 : L-1] + ((I64)cost[c][(int)r[j]] << 32), v = prev[j] + G ;
+	{ I64 d = (j ? prev[j-1] : prev[L-1] + WRAP) + ((I64)cost[c][(int)r[j]] << 32), v = prev[j] + G ;
 	  cur[j] = d < v ? d : v ;
 	}
       // gaps in S along the row (R[j] alone), round the circle: a first pass from column 0, entering from
       // column L-1, then on round while it still improves cells
-      I64 h = cur[L-1] + G ;
+      I64 h = cur[L-1] + G + WRAP ;
       for (int j = 0 ; j < L ; ++j) { if (h < cur[j]) cur[j] = h ; h = cur[j] + G ; }
+      h += WRAP ; // round again
       for (int j = 0 ; j < L && h < cur[j] ; ++j) { cur[j] = h ; h += G ; }
       rowMin = cur[0] ;
       for (int j = 1 ; j < L ; ++j) if (cur[j] < rowMin) rowMin = cur[j] ;
       I64 *t = prev ; prev = cur ; cur = t ;
       if ((rowMin >> 32) > threshold) // LB > threshold: no alignment can now end at or below it
-	{ newFree (prev, L, I64) ; newFree (cur, L, I64) ;
+	{ __atomic_fetch_add (&cyclicStats.earlyExit, 1, __ATOMIC_RELAXED) ;
+	  newFree (prev, L, I64) ; newFree (cur, L, I64) ;
 	  return rowMin >> 32 ;
 	}
     }
   int lb = NO_THRESHOLD, ub = NO_THRESHOLD ;
   for (int j = 0 ; j < L ; ++j)
-    { int c = prev[j] >> 32, start = prev[j] & 0xffffffff ;
+    { int c = prev[j] >> 32, label = prev[j] & 0xffffffff, start = label % L, wraps = label / L ;
       if (c < lb) lb = c ;
-      if (start == ((j+1 == L) ? 0 : j+1) && c < ub) ub = c ; // went exactly once round R
+      if (start == ((j+1 == L) ? 0 : j+1) && wraps == 1 && c < ub) ub = c ; // exactly once round R
     }
   int result = ub ;
+  if (lb > threshold) __atomic_fetch_add (&cyclicStats.lowerBound, 1, __ATOMIC_RELAXED) ;
+  else if (ub <= threshold) __atomic_fetch_add (&cyclicStats.upperBound, 1, __ATOMIC_RELAXED) ;
   if (lb <= threshold && ub > threshold) // undecided: align from the starts suggested by the cheapest cells
     { __atomic_fetch_add (&cyclicStats.ambiguous, 1, __ATOMIC_RELAXED) ;
       // Paths from neighbouring starts merge within a few rows, so a cell often holds a neighbour's start.
@@ -192,7 +199,7 @@ static int cyclicCost (Seq *a, Seq *b, ScoreParams *sp, int threshold)
 	{ int bj = -1 ; // the cheapest cell not yet used
 	  for (int j = 0 ; j < L ; ++j) if ((prev[j] >> 32) < NO_THRESHOLD && (bj < 0 || prev[j] < prev[bj])) bj = j ;
 	  if (bj < 0 || (prev[bj] >> 32) > threshold) break ;
-	  int starts[2] = { (bj+1) % L, prev[bj] & 0xffffffff } ;
+	  int starts[2] = { (bj+1) % L, (prev[bj] & 0xffffffff) % L } ;
 	  prev[bj] = (I64)NO_THRESHOLD << 32 ; // used
 	  for (int q = 0 ; q < 2 && result > threshold ; ++q)
 	    { int t ; for (t = 0 ; t < nTried ; ++t) if (tried[t] == starts[q]) break ;
@@ -301,15 +308,14 @@ static void runThreads (void *(*f)(void*), void *arg, int nThread)
 #define CYCLIC (-2)
 typedef struct { int i, j, threshold, score, offset, level ; } Pair ;
 
-// the best satscan score of a global alignment of the longer of i and j against the shorter as a circle,
-// in either orientation, using scheme level; a bound at most threshold if it cannot be above threshold
+// the best satscan score of a single-cycle alignment of i and j, from any rotation of the longer but with no
+// multiple copies, in either orientation, using scheme level; a bound at most threshold if it cannot be above
 static int satPairScore (Array aSeq, int i, int j, int level, int threshold)
 {
-  Seq *t = arrp(aSeq,i,Seq), *q = arrp(aSeq,j,Seq) ;
-  if (q->len > t->len) { Seq *x = t ; t = q ; q = x ; }
+  Seq *a = arrp(aSeq,i,Seq), *b = arrp(aSeq,j,Seq) ;
   const SatScheme *sp = &satScheme[level] ;
-  int score1 = satGlobalScore (t->seq, t->len, q->seq, q->len, sp, threshold) ;
-  int score2 = satGlobalScore (t->seq, t->len, q->rSeq, q->len, sp, score1 > threshold ? score1 : threshold) ;
+  int score1 = satCyclicScore (a->seq, a->len, b->seq, b->len, sp, threshold) ;
+  int score2 = satCyclicScore (a->seq, a->len, b->rSeq, b->len, sp, score1 > threshold ? score1 : threshold) ;
   return score1 > score2 ? score1 : score2 ;
 }
 
@@ -428,8 +434,9 @@ static int clusterGreedy (Array aSeq, ScoreParams *sp, double threshFac, int nTh
 	}
     }
   int nCluster = arrayMax(aRep) ;
-  fprintf (stderr, "greedy clustering: %d clusters; %lld pairs rejected by length, %lld alignments, %lld undecided by bounds of which %lld linked by rotated alignment\t",
-	   nCluster, (long long)nLengthReject, (long long)cyclicStats.aligned, (long long)cyclicStats.ambiguous, (long long)cyclicStats.resolved) ;
+  fprintf (stderr, "greedy clustering: %d clusters; %lld pairs rejected by length, %lld alignments: rejected early %lld, by lower bound %lld, accepted by upper bound %lld, undecided %lld of which %lld linked by rotated alignment\t",
+	   nCluster, (long long)nLengthReject, (long long)cyclicStats.aligned, (long long)cyclicStats.earlyExit, (long long)cyclicStats.lowerBound,
+	   (long long)cyclicStats.upperBound, (long long)cyclicStats.ambiguous, (long long)cyclicStats.resolved) ;
   timeUpdate (stderr) ;
 
   arrayDestroy (aPair) ; arrayDestroy (aRep) ; newFree (order, nSeq, int) ;
@@ -501,9 +508,10 @@ static void chooseRepresentatives (Array aSeq, ScoreParams *sp, int nThread, int
 
 // Single linkage of the clusters over all pairs of their representatives, in cluster order, keeping the
 // lower cluster number, so that e.g. subfamilies of a satellite are joined. Pairs are scored as satscan
-// would, more sensitively than by satmatch's costs: a global alignment of the longer representative against
-// the shorter as a circle, with the stricter of the two schemes safe for their compositions, and are linked
-// if the score is above minScore. Representatives safe for no scheme are not linked. Sets isMerged[k] for
+// would, more sensitively than by satmatch's costs: a single-cycle alignment, from any rotation of the
+// longer representative but with no multiple copies of the shorter, with the stricter of the two schemes
+// safe for their compositions, and are linked if the score is above minScore. A pair whose lengths alone
+// show it cannot score above minScore, satCyclicBound(), is not aligned. Representatives safe for no scheme are not linked. Sets isMerged[k] for
 // each cluster k that others are merged into, and returns the number of merges.
 static int linkRepresentatives (Array aSeq, ScoreParams *sp, int minScore, int nThread,
 				int *cluster, int nCluster, int *rep, bool *isMerged)
@@ -515,13 +523,21 @@ static int linkRepresentatives (Array aSeq, ScoreParams *sp, int minScore, int n
   for (int k = 1 ; k <= nCluster ; ++k) if (isUsed[k]) array(aK, arrayMax(aK), int) = k ;
   int nK = arrayMax(aK) ;
   Array aPair = arrayCreate (1024, Pair) ;
+  int nBound = 0 ;
+  long long aligned0 = satCyclicAligned, undecided0 = satCyclicUndecided, resolved0 = satCyclicResolved ;
+  long long early0 = satCyclicEarly, upper0 = satCyclicUpper, lower0 = satCyclicLower ;
   for (int a = 0 ; a < nK ; ++a)
     for (int b = a+1 ; b < nK ; ++b)
       { int i = rep[arr(aK,a,int)], j = rep[arr(aK,b,int)] ;
 	int li = arrp(aSeq,i,Seq)->level, lj = arrp(aSeq,j,Seq)->level ;
 	Pair *p = addPair (aPair, i, j, minScore) ;
 	if (li == MAX_SCHEME || lj == MAX_SCHEME) p->score = minScore ; // not linked, and not aligned
-	else p->level = li > lj ? li : lj ;
+	else
+	  { int level = li > lj ? li : lj ;
+	    int bound = satCyclicBound (arrp(aSeq,i,Seq)->len, arrp(aSeq,j,Seq)->len, &satScheme[level]) ;
+	    if (bound <= minScore) { p->score = bound ; ++nBound ; } // can't link: not aligned
+	    else p->level = level ;
+	  }
       }
   scorePairs (aSeq, sp, aPair, nThread) ;
   int *map = new (nCluster+1, int) ; // the cluster each cluster is merged into
@@ -542,7 +558,10 @@ static int linkRepresentatives (Array aSeq, ScoreParams *sp, int minScore, int n
 	  }
       }
   for (int i = 0 ; i < nSeq ; ++i) cluster[i] = map[cluster[i]] ;
-  fprintf (stderr, "linking representatives: %d merges, %d clusters\t", nMerge, nK - nMerge) ; timeUpdate (stderr) ;
+  fprintf (stderr, "linking representatives: %d merges, %d clusters; %d pairs rejected by length, %lld alignments: rejected early %lld, by upper bound %lld, accepted by lower bound %lld, undecided %lld of which %lld linked by rotated alignment\t",
+	   nMerge, nK - nMerge, nBound, satCyclicAligned - aligned0, satCyclicEarly - early0, satCyclicUpper - upper0, satCyclicLower - lower0,
+	   satCyclicUndecided - undecided0, satCyclicResolved - resolved0) ;
+  timeUpdate (stderr) ;
   newFree (map, nCluster+1, int) ; newFree (isUsed, nCluster+1, bool) ;
   arrayDestroy (aPair) ; arrayDestroy (aK) ;
   return nMerge ;
